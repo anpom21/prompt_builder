@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -152,6 +153,9 @@ class MainWindow(QMainWindow):
                 font-family: "Segoe UI";
                 font-size: 10pt;
             }
+            QLabel, QGroupBox, QStatusBar {
+                color: #e2e8f0;
+            }
             QFrame#heroCard, QFrame#card {
                 background: rgba(15, 23, 42, 0.88);
                 border: 1px solid rgba(148, 163, 184, 0.18);
@@ -186,6 +190,16 @@ class MainWindow(QMainWindow):
                 border-radius: 10px;
                 padding: 8px;
                 selection-background-color: #0ea5e9;
+            }
+            QComboBox QAbstractItemView {
+                background: #111827;
+                color: #f8fafc;
+                border: 1px solid rgba(148, 163, 184, 0.22);
+                selection-background-color: #0ea5e9;
+                selection-color: white;
+            }
+            QStatusBar {
+                background: #0f172a;
             }
             QPlainTextEdit:focus, QLineEdit:focus, QComboBox:focus, QSpinBox:focus {
                 border: 1px solid #38bdf8;
@@ -302,52 +316,6 @@ class MainWindow(QMainWindow):
         header_layout.addLayout(title_stack, 2)
         header_layout.addLayout(button_row, 3)
 
-        prompt_card = QFrame()
-        prompt_card.setObjectName("card")
-        prompt_layout = QVBoxLayout(prompt_card)
-        prompt_layout.setContentsMargins(18, 18, 18, 18)
-        prompt_layout.setSpacing(12)
-
-        prompt_heading = QLabel("Prompt")
-        prompt_heading.setObjectName("sectionLabel")
-        prompt_layout.addWidget(prompt_heading)
-
-        self.user_prompt_edit = QPlainTextEdit()
-        self.user_prompt_edit.setPlaceholderText("Describe the task you want the LLM to perform.")
-        self.user_prompt_edit.setMinimumHeight(120)
-        prompt_layout.addWidget(self.user_prompt_edit)
-
-        system_row = QHBoxLayout()
-        template_col = QVBoxLayout()
-        template_label = QLabel("LLM Task")
-        self.system_template_combo = QComboBox()
-        for template_id in list(LLM_TASK_TEMPLATES.keys()) + ["custom"]:
-            self.system_template_combo.addItem(template_id.replace("_", " ").title(), template_id)
-        self.system_template_combo.currentIndexChanged.connect(self._on_system_template_changed)
-        self.custom_system_prompt = QPlainTextEdit()
-        self.custom_system_prompt.setPlaceholderText("Write a custom LLM task here.")
-        self.custom_system_prompt.setMinimumHeight(110)
-        self.custom_system_prompt.textChanged.connect(self._set_system_template_preview)
-        template_col.addWidget(template_label)
-        template_col.addWidget(self.system_template_combo)
-        template_col.addWidget(self.custom_system_prompt)
-
-        preview_col = QVBoxLayout()
-        preview_label = QLabel("Resolved LLM Task")
-        self.system_preview = QLabel()
-        self.system_preview.setWordWrap(True)
-        self.system_preview.setObjectName("resolvedPrompt")
-        preview_col.addWidget(preview_label)
-        preview_col.addWidget(self.system_preview, 1)
-
-        system_row.addLayout(template_col, 3)
-        system_row.addLayout(preview_col, 2)
-        prompt_layout.addLayout(system_row)
-
-        self.disk_note = QLabel("Files are read from disk, so save files before importing or dragging them in.")
-        self.disk_note.setObjectName("hintLabel")
-        prompt_layout.addWidget(self.disk_note)
-
         self.settings_panel = QFrame()
         self.settings_panel.setObjectName("card")
         self.settings_panel.setVisible(False)
@@ -401,30 +369,15 @@ class MainWindow(QMainWindow):
             top_controls.addWidget(button)
         top_controls.addStretch(1)
 
-        self.add_file_button.clicked.connect(self.add_files)
-        self.add_folder_button.clicked.connect(self.add_folder)
-        self.settings_button.clicked.connect(self.toggle_settings_panel)
-        self.remove_button.clicked.connect(self.remove_selected)
-        self.include_full_button.clicked.connect(self.include_full_selected)
-        self.include_truncated_button.clicked.connect(self.include_truncated_selected)
-        self.exclude_button.clicked.connect(self.exclude_selected)
-        self.refresh_button.clicked.connect(self.request_rebuild)
-        self.copy_button.clicked.connect(self.copy_json)
-        self.save_session_button.clicked.connect(self.save_session)
-        self.load_session_button.clicked.connect(self.load_session)
-        self.export_button.clicked.connect(self.export_json)
-
         root_layout.addWidget(header)
-        root_layout.addWidget(prompt_card)
         root_layout.addWidget(self.settings_panel)
-        root_layout.addLayout(top_controls)
-        self._apply_default_settings()
-        self._apply_styles()
 
         splitter = QSplitter(Qt.Horizontal)
         left_container = QWidget()
         left_layout = QVBoxLayout(left_container)
         left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(10)
+        left_layout.addLayout(top_controls)
         self.views = QTabWidget()
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["Context tree", "Type", "Size"])
@@ -445,6 +398,11 @@ class MainWindow(QMainWindow):
         self.flat_table.setHorizontalHeaderLabels(["File", "Type", "Mode", "Size", "Included", "Context"])
         self.flat_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.flat_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.flat_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.flat_table.horizontalHeader().setStretchLastSection(True)
+        self.flat_table.setColumnWidth(0, 560)
+        self.flat_table.setColumnWidth(1, 160)
+        self.flat_table.setColumnWidth(2, 110)
         self.flat_table.itemSelectionChanged.connect(self.on_table_selection_changed)
         self.flat_table.installEventFilter(self)
         flat_layout.addWidget(self.search_edit)
@@ -478,14 +436,64 @@ class MainWindow(QMainWindow):
         overview_layout.addWidget(self.bundle_summary)
         self.preview_tabs.addTab(overview_page, "Overview")
 
+        task_card = QFrame()
+        task_card.setObjectName("card")
+        task_layout = QVBoxLayout(task_card)
+        task_layout.setContentsMargins(18, 18, 18, 18)
+        task_layout.setSpacing(12)
+        task_heading = QLabel("LLM Task")
+        task_heading.setObjectName("sectionLabel")
+        self.system_template_combo = QComboBox()
+        for template_id in list(LLM_TASK_TEMPLATES.keys()) + ["custom"]:
+            self.system_template_combo.addItem(template_id.replace("_", " ").title(), template_id)
+        self.system_template_combo.currentIndexChanged.connect(self._on_system_template_changed)
+        self.custom_system_prompt = QPlainTextEdit()
+        self.custom_system_prompt.setPlaceholderText("Write a custom LLM task here.")
+        self.custom_system_prompt.setMinimumHeight(130)
+        self.custom_system_prompt.textChanged.connect(self._on_prompt_fields_changed)
+        resolved_label = QLabel("Resolved LLM Task")
+        resolved_label.setObjectName("sectionLabel")
+        self.system_preview = QLabel()
+        self.system_preview.setWordWrap(True)
+        self.system_preview.setObjectName("resolvedPrompt")
+        task_layout.addWidget(task_heading)
+        task_layout.addWidget(self.system_template_combo)
+        task_layout.addWidget(self.custom_system_prompt, 2)
+        task_layout.addWidget(resolved_label)
+        task_layout.addWidget(self.system_preview, 1)
+        task_layout.addStretch(1)
+
         splitter.addWidget(left_container)
         splitter.addWidget(self.preview_tabs)
-        splitter.setStretchFactor(0, 2)
-        splitter.setStretchFactor(1, 3)
+        splitter.addWidget(task_card)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 4)
+        splitter.setStretchFactor(2, 2)
+        splitter.setSizes([420, 560, 360])
         root_layout.addWidget(splitter, 1)
+
+        prompt_card = QFrame()
+        prompt_card.setObjectName("card")
+        prompt_layout = QVBoxLayout(prompt_card)
+        prompt_layout.setContentsMargins(18, 18, 18, 18)
+        prompt_layout.setSpacing(12)
+        prompt_heading = QLabel("User Prompt")
+        prompt_heading.setObjectName("sectionLabel")
+        self.user_prompt_edit = QPlainTextEdit()
+        self.user_prompt_edit.setPlaceholderText("Describe the task you want the LLM to perform. This is placed at the bottom like a traditional chat prompt.")
+        self.user_prompt_edit.setMinimumHeight(120)
+        self.user_prompt_edit.textChanged.connect(self._on_prompt_fields_changed)
+        self.disk_note = QLabel("Files are read from disk, so save files before importing or dragging them in.")
+        self.disk_note.setObjectName("hintLabel")
+        prompt_layout.addWidget(prompt_heading)
+        prompt_layout.addWidget(self.user_prompt_edit)
+        prompt_layout.addWidget(self.disk_note)
+        root_layout.addWidget(prompt_card)
 
         footer = QHBoxLayout()
         self.status_label = QLabel("Ready.")
+        self.token_count_label = QLabel("Estimated JSON tokens: 0")
+        self.token_count_label.setObjectName("hintLabel")
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
@@ -493,10 +501,26 @@ class MainWindow(QMainWindow):
         self.cancel_button = QPushButton("Cancel")
         self.cancel_button.clicked.connect(self.cancel_build)
         footer.addWidget(self.status_label, 3)
+        footer.addWidget(self.token_count_label, 2)
         footer.addWidget(self.progress_bar, 2)
         footer.addWidget(self.cancel_button)
         root_layout.addLayout(footer)
 
+        self.add_file_button.clicked.connect(self.add_files)
+        self.add_folder_button.clicked.connect(self.add_folder)
+        self.settings_button.clicked.connect(self.toggle_settings_panel)
+        self.remove_button.clicked.connect(self.remove_selected)
+        self.include_full_button.clicked.connect(self.include_full_selected)
+        self.include_truncated_button.clicked.connect(self.include_truncated_selected)
+        self.exclude_button.clicked.connect(self.exclude_selected)
+        self.refresh_button.clicked.connect(self.request_rebuild)
+        self.copy_button.clicked.connect(self.copy_json)
+        self.save_session_button.clicked.connect(self.save_session)
+        self.load_session_button.clicked.connect(self.load_session)
+        self.export_button.clicked.connect(self.export_json)
+
+        self._apply_default_settings()
+        self._apply_styles()
         self.setCentralWidget(central)
         self.statusBar().setSizeGripEnabled(False)
         self.statusBar().showMessage("Ready")
@@ -504,6 +528,7 @@ class MainWindow(QMainWindow):
     def _sync_settings_controls(self) -> None:
         self._set_system_template_preview()
         self._update_input_summary()
+        self._update_token_count()
 
     def _update_input_summary(self) -> None:
         count = len(self.input_paths)
@@ -534,7 +559,16 @@ class MainWindow(QMainWindow):
         self.system_preview.setText(preview)
 
     def _on_system_template_changed(self, *_: object) -> None:
+        self._on_prompt_fields_changed()
+
+    def _on_prompt_fields_changed(self) -> None:
         self._set_system_template_preview()
+        if self.workspace is None:
+            self._update_token_count()
+            return
+        self._sync_current_bundle()
+        if self.current_result is not None:
+            self._show_bundle_summary(self.current_result)
 
     def current_prompt_fields(self) -> PromptFields:
         template_id = str(self.system_template_combo.currentData())
@@ -577,6 +611,7 @@ class MainWindow(QMainWindow):
             self.preview.clear()
             self.detail_label.setText("Add a file or folder to begin.")
             self.bundle_summary.clear()
+            self._update_token_count()
             self.status_label.setText("No input paths.")
             self.statusBar().showMessage("No input paths")
             return
@@ -706,23 +741,52 @@ class MainWindow(QMainWindow):
         file_count = len(bundle["files"])
         graph_groups = len(bundle["dependency_graph"])
         linked_files = sum(len(item["includes"]) for item in bundle["dependency_graph"])
+        json_bytes = len(result.json_text.encode("utf-8"))
+        json_chars = len(result.json_text)
+        estimated_tokens = self._estimate_tokens(result.json_text)
+        self._update_token_count(estimated_tokens, json_bytes)
         self.bundle_summary.setPlainText(
             "\n".join(
                 [
                     f"Files: {file_count}",
                     f"Dependency groups: {graph_groups}",
                     f"Linked files: {linked_files}",
-                    f"System prompt chars: {len(bundle['system_prompt'])}",
-                    f"LLM task chars: {len(bundle['llm_task'])}",
-                    f"User prompt chars: {len(bundle['user_prompt'])}",
+                    f"JSON chars: {json_chars:,}",
+                    f"JSON bytes: {json_bytes:,}",
+                    f"Estimated JSON tokens: {estimated_tokens:,}",
+                    f"System prompt chars: {len(bundle['system_prompt']):,}",
+                    f"LLM task chars: {len(bundle['llm_task']):,}",
+                    f"User prompt chars: {len(bundle['user_prompt']):,}",
                 ]
             )
+        )
+
+    def _estimate_tokens(self, text: str) -> int:
+        if not text:
+            return 0
+        return max(1, (len(text) + 3) // 4)
+
+    def _update_token_count(self, estimated_tokens: int | None = None, json_bytes: int | None = None) -> None:
+        if estimated_tokens is None:
+            if self.current_result is None:
+                estimated_tokens = 0
+                json_bytes = 0 if json_bytes is None else json_bytes
+            else:
+                estimated_tokens = self._estimate_tokens(self.current_result.json_text)
+                json_bytes = len(self.current_result.json_text.encode("utf-8"))
+        elif json_bytes is None:
+            json_bytes = len(self.current_result.json_text.encode("utf-8")) if self.current_result else 0
+        self.token_count_label.setText(f"Estimated JSON tokens: {estimated_tokens:,}")
+        self.token_count_label.setToolTip(
+            f"Approximate token count from serialized JSON size ({json_bytes:,} bytes)."
         )
 
     def _refresh_all_views(self) -> None:
         self._sync_current_bundle()
         self.refresh_tree()
         self.refresh_flat_table()
+        if self.current_result is not None:
+            self._show_bundle_summary(self.current_result)
         if self.selected_file_id and self.workspace and self.selected_file_id in self.workspace.files:
             self.show_record(self.selected_file_id)
 
@@ -737,6 +801,7 @@ class MainWindow(QMainWindow):
                 bundle=bundle,
                 json_text=serialize_bundle(bundle),
             )
+            self._update_token_count()
         except BuildError:
             return
 
