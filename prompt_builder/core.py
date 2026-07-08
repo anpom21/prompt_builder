@@ -75,7 +75,8 @@ PROJECT_MARKERS = {
 }
 
 COMMON_SOURCE_ROOTS = ("src", "lib", "app", "python", "source")
-SYSTEM_PROMPT_TEMPLATES: dict[str, str] = {
+SYSTEM_PROMPT_FILENAME = "system_prompt.md"
+LLM_TASK_TEMPLATES: dict[str, str] = {
     "code_editing": (
         "You are a careful coding assistant. Make the requested changes, keep the "
         "solution grounded in the provided repository context, and explain any "
@@ -125,13 +126,13 @@ class PromptTemplateMode:
     def resolved_text(self) -> str:
         if self.mode == "custom":
             return self.custom_text.strip()
-        return SYSTEM_PROMPT_TEMPLATES.get(self.template_id, SYSTEM_PROMPT_TEMPLATES["code_editing"])
+        return LLM_TASK_TEMPLATES.get(self.template_id, LLM_TASK_TEMPLATES["code_editing"])
 
 
 @dataclass(slots=True)
 class PromptFields:
+    llm_task: PromptTemplateMode = field(default_factory=PromptTemplateMode)
     user_prompt: str = ""
-    system: PromptTemplateMode = field(default_factory=PromptTemplateMode)
 
 
 @dataclass(slots=True)
@@ -261,9 +262,10 @@ class Workspace:
                 files.append(_file_record_to_json(record))
         dependency_graph = _dependency_graph_to_json(self.dependency_graph)
         bundle = {
-            "schema_version": SCHEMA_VERSION,
+            "system_prompt": load_system_prompt(),
+            "llm_task": prompt.llm_task.resolved_text(),
             "user_prompt": prompt.user_prompt,
-            "system_prompt": prompt.system.resolved_text(),
+            "schema_version": SCHEMA_VERSION,
             "files": files,
             "dependency_graph": dependency_graph,
         }
@@ -374,16 +376,29 @@ def build_prompt_bundle(
     return BundleBuilder().build(request, progress=progress, should_cancel=should_cancel)
 
 
+def load_system_prompt() -> str:
+    prompt_path = Path(__file__).resolve().parent.parent / SYSTEM_PROMPT_FILENAME
+    try:
+        prompt_text = prompt_path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise BuildError(f"Unable to read {SYSTEM_PROMPT_FILENAME}: {exc}") from exc
+
+    if not prompt_text:
+        raise BuildError(f"{SYSTEM_PROMPT_FILENAME} is empty.")
+    return prompt_text
+
+
 def serialize_bundle(bundle: dict) -> str:
     validate_bundle(bundle)
-    return json.dumps(bundle, indent=2, ensure_ascii=False, sort_keys=True)
+    return json.dumps(bundle, indent=2, ensure_ascii=False)
 
 
 def validate_bundle(bundle: dict) -> None:
     required = {
-        "schema_version",
-        "user_prompt",
         "system_prompt",
+        "llm_task",
+        "user_prompt",
+        "schema_version",
         "files",
         "dependency_graph",
     }

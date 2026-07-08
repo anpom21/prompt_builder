@@ -45,7 +45,7 @@ from .core import (
     DEFAULT_TRUNCATION_SIZE,
     PromptFields,
     PromptTemplateMode,
-    SYSTEM_PROMPT_TEMPLATES,
+    LLM_TASK_TEMPLATES,
     TreeNode,
     build_prompt_bundle,
     serialize_bundle,
@@ -319,13 +319,13 @@ class MainWindow(QMainWindow):
 
         system_row = QHBoxLayout()
         template_col = QVBoxLayout()
-        template_label = QLabel("System prompt")
+        template_label = QLabel("LLM Task")
         self.system_template_combo = QComboBox()
-        for template_id in list(SYSTEM_PROMPT_TEMPLATES.keys()) + ["custom"]:
+        for template_id in list(LLM_TASK_TEMPLATES.keys()) + ["custom"]:
             self.system_template_combo.addItem(template_id.replace("_", " ").title(), template_id)
         self.system_template_combo.currentIndexChanged.connect(self._on_system_template_changed)
         self.custom_system_prompt = QPlainTextEdit()
-        self.custom_system_prompt.setPlaceholderText("Write a custom system prompt here.")
+        self.custom_system_prompt.setPlaceholderText("Write a custom LLM task here.")
         self.custom_system_prompt.setMinimumHeight(110)
         self.custom_system_prompt.textChanged.connect(self._set_system_template_preview)
         template_col.addWidget(template_label)
@@ -333,7 +333,7 @@ class MainWindow(QMainWindow):
         template_col.addWidget(self.custom_system_prompt)
 
         preview_col = QVBoxLayout()
-        preview_label = QLabel("Resolved prompt")
+        preview_label = QLabel("Resolved LLM Task")
         self.system_preview = QLabel()
         self.system_preview.setWordWrap(True)
         self.system_preview.setObjectName("resolvedPrompt")
@@ -527,10 +527,10 @@ class MainWindow(QMainWindow):
         template_id = self.system_template_combo.currentData()
         if template_id == "custom":
             self.custom_system_prompt.setEnabled(True)
-            preview = self.custom_system_prompt.toPlainText().strip() or "Custom system prompt mode."
+            preview = self.custom_system_prompt.toPlainText().strip() or "Custom LLM task mode."
         else:
             self.custom_system_prompt.setEnabled(False)
-            preview = SYSTEM_PROMPT_TEMPLATES.get(template_id, SYSTEM_PROMPT_TEMPLATES["code_editing"])
+            preview = LLM_TASK_TEMPLATES.get(template_id, LLM_TASK_TEMPLATES["code_editing"])
         self.system_preview.setText(preview)
 
     def _on_system_template_changed(self, *_: object) -> None:
@@ -540,12 +540,12 @@ class MainWindow(QMainWindow):
         template_id = str(self.system_template_combo.currentData())
         mode = "custom" if template_id == "custom" else "template"
         return PromptFields(
-            user_prompt=self.user_prompt_edit.toPlainText(),
-            system=PromptTemplateMode(
+            llm_task=PromptTemplateMode(
                 mode=mode,
                 template_id=template_id if template_id != "custom" else "code_editing",
                 custom_text=self.custom_system_prompt.toPlainText(),
             ),
+            user_prompt=self.user_prompt_edit.toPlainText(),
         )
 
     def current_settings(self) -> BuildSettings:
@@ -712,6 +712,8 @@ class MainWindow(QMainWindow):
                     f"Files: {file_count}",
                     f"Dependency groups: {graph_groups}",
                     f"Linked files: {linked_files}",
+                    f"System prompt chars: {len(bundle['system_prompt'])}",
+                    f"LLM task chars: {len(bundle['llm_task'])}",
                     f"User prompt chars: {len(bundle['user_prompt'])}",
                 ]
             )
@@ -1047,12 +1049,12 @@ class MainWindow(QMainWindow):
         state = SessionState(
             input_paths=list(self.input_paths),
             prompt={
-                "user_prompt": self.user_prompt_edit.toPlainText(),
-                "system": {
+                "llm_task": {
                     "mode": "custom" if self.system_template_combo.currentData() == "custom" else "template",
                     "template_id": self.system_template_combo.currentData(),
                     "custom_text": self.custom_system_prompt.toPlainText(),
                 },
+                "user_prompt": self.user_prompt_edit.toPlainText(),
             },
             settings=asdict(self.current_settings()),
             file_overrides=dict(self.file_overrides),
@@ -1067,14 +1069,14 @@ class MainWindow(QMainWindow):
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
         self.input_paths = list(payload.get("input_paths", []))
         prompt = payload.get("prompt", {})
-        self.user_prompt_edit.setPlainText(prompt.get("user_prompt", ""))
-        system = prompt.get("system", {})
-        template_id = system.get("template_id", "code_editing")
+        llm_task = prompt.get("llm_task", prompt.get("system", {}))
+        template_id = llm_task.get("template_id", "code_editing")
         index = self.system_template_combo.findData(template_id)
         if index < 0:
             index = self.system_template_combo.findData("custom")
         self.system_template_combo.setCurrentIndex(index)
-        self.custom_system_prompt.setPlainText(system.get("custom_text", ""))
+        self.custom_system_prompt.setPlainText(llm_task.get("custom_text", ""))
+        self.user_prompt_edit.setPlainText(prompt.get("user_prompt", ""))
         settings = payload.get("settings", {})
         self.project_root_edit.setText(settings.get("project_root_override", ""))
         self.import_roots_edit.setText(", ".join(settings.get("import_root_overrides", [])))

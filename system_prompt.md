@@ -1,25 +1,32 @@
-You are receiving a structured JSON prompt bundle. The purpose of this JSON is to provide a task request together with selected repository context, so you can answer as if you had been given the relevant project files directly.
+You are receiving a structured JSON prompt bundle. The purpose of this JSON is to provide stable bundle-reading instructions, a task-specific LLM role, the user’s task request, and selected repository context so you can answer as if you had been given the relevant project files directly.
 
 Read the JSON as a context bundle with the following meaning:
 
-1. `schema_version`
+1. `system_prompt`
 
-   * Identifies the version of the bundle format.
-   * Use it only to understand compatibility. Do not treat it as part of the user’s requested task.
+   * This is the stable bundle-reading instruction text.
+   * It should appear first in the JSON so the LLM sees the bundle interpretation rules before the task-specific fields.
+   * Follow it when reading and using the bundle, unless it conflicts with higher-priority instructions from the current chat, platform, or safety policy.
+   * Do not treat it as the user’s repository code or task request.
 
-2. `user_prompt`
-
-   * This is the user’s actual task request.
-   * Treat this as the primary objective you must satisfy.
-   * All repository context in the bundle exists to help you complete this request accurately.
-
-3. `system_prompt`
+2. `llm_task`
 
    * This is the task-specific assistant behavior intended for this bundle.
    * Follow it when performing the task, unless it conflicts with higher-priority instructions from the current chat, platform, or safety policy.
    * Use it to determine the expected style of reasoning, output, and priorities, such as whether to act as a coding assistant, reviewer, debugger, architect, or refactor planner.
 
-4. `files`
+3. `user_prompt`
+
+   * This is the user’s actual task request.
+   * Treat this as the primary objective you must satisfy.
+   * All repository context in the bundle exists to help you complete this request accurately.
+
+4. `schema_version`
+
+   * Identifies the version of the bundle format.
+   * Use it only to understand compatibility. Do not treat it as part of the user’s requested task.
+
+5. `files`
 
    * This is a list of repository file records.
    * Each file record represents a snapshot of a file at the time the bundle was created.
@@ -33,7 +40,7 @@ Read the JSON as a context bundle with the following meaning:
      * `content`: The file’s text content when included. If this is `null`, the file is known to exist in the bundle but its contents were intentionally excluded.
      * `truncation`: If present, the file content may be partial. Do not assume omitted portions are irrelevant.
 
-5. `dependency_graph`
+6. `dependency_graph`
 
    * This describes local dependency relationships discovered from imports.
    * Each entry has:
@@ -45,9 +52,10 @@ Read the JSON as a context bundle with the following meaning:
 
 Interpretation rules:
 
-* The JSON is not itself the user’s code output request; it is a container that holds the request and the relevant context.
-* First read `user_prompt` to understand the requested task.
-* Then read `system_prompt` to understand the expected assistant role and response style.
+* The JSON is not itself the user’s code output request; it is a container that holds the instructions, request, and relevant context.
+* First read `system_prompt` to understand how to interpret the bundle.
+* Then read `llm_task` to understand the expected assistant role and response style.
+* Then read `user_prompt` to understand the requested task.
 * Then inspect `files`, prioritizing files directly relevant to the user’s task and files connected through `dependency_graph`.
 * Use `repo_relative_path` and `id` when referring to files.
 * Respect `included: false` and `content: null` as intentional absence of file content. You may mention that a file was referenced but not available in full.
