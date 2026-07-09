@@ -27,28 +27,33 @@ The app is intended for coding workflows where you want to give an LLM the relev
 
 ## Install
 
-Create and activate a virtual environment:
+### Python dependencies
+Install python dependencies:
 
 ```bash
-python -m venv .venv
+uv sync
 ```
 
-On Windows:
+### File icons
+
+Prompt Builder can show Material Icon Theme file icons in the tree and flat file views.
+
+Install the VS Code Material Icon Theme extension, then copy its icon assets into the app:
 
 ```bash
-.venv\Scripts\activate
+code --install-extension PKief.material-icon-theme
+
+material_dir=$(find ~/.vscode/extensions -maxdepth 1 -type d -iname 'pkief.material-icon-theme-*' | sort | tail -n 1)
+mkdir -p prompt_builder/icons/material-icon-theme
+cp -a "$material_dir/icons" prompt_builder/icons/material-icon-theme/
 ```
 
-On macOS/Linux:
-
-```bash
-source .venv/bin/activate
-```
-
-Install dependencies:
-
-```bash
-pip install PySide6
+The final folder should look like this:
+    
+```text
+prompt_builder/icons/material-icon-theme/icons/python.svg
+prompt_builder/icons/material-icon-theme/icons/yaml.svg
+prompt_builder/icons/material-icon-theme/icons/markdown.svg
 ```
 
 ## Usage

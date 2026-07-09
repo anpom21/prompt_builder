@@ -122,7 +122,7 @@ class MainWindow(QMainWindow):
         self._refreshing_tree = False
         self._refreshing_table = False
         self._file_icon_cache: dict[str, QIcon] = {}
-        self._vscode_icon_theme = self._load_vscode_icon_theme()
+        self._material_icon_dir = Path(__file__).resolve().parent / "icons" / "material-icon-theme" / "icons"
 
         self._build_ui()
         self._sync_settings_controls()
@@ -848,58 +848,6 @@ class MainWindow(QMainWindow):
             item.setIcon(0, self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon))
         return item
 
-    def _load_vscode_icon_theme(self) -> dict | None:
-        for theme_path in self._vscode_icon_theme_candidates():
-            if not theme_path.exists():
-                continue
-            try:
-                payload = json.loads(theme_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                self._log("Skipping unreadable VS Code icon theme: %s", theme_path)
-                continue
-
-            definitions = payload.get("iconDefinitions", {})
-            if not isinstance(definitions, dict):
-                continue
-
-            self._log("Using VS Code file icon theme: %s", theme_path)
-            return {
-                "root": theme_path.parent,
-                "definitions": definitions,
-                "file_names": self._normalized_icon_map(payload.get("fileNames", {})),
-                "file_extensions": self._normalized_icon_map(payload.get("fileExtensions", {})),
-                "default_file": payload.get("file"),
-            }
-        return None
-
-    def _vscode_icon_theme_candidates(self) -> list[Path]:
-        bundled_icon_dir = Path(__file__).resolve().parent / "icons"
-        candidates = [
-            bundled_icon_dir / "vscode-seti" / "vs-seti-icon-theme.json",
-            bundled_icon_dir / "vs-seti-icon-theme.json",
-            Path("/usr/share/code/resources/app/extensions/theme-seti/icons/vs-seti-icon-theme.json"),
-            Path("/usr/share/code-insiders/resources/app/extensions/theme-seti/icons/vs-seti-icon-theme.json"),
-            Path("/snap/code/current/usr/share/code/resources/app/extensions/theme-seti/icons/vs-seti-icon-theme.json"),
-            Path("/snap/code-insiders/current/usr/share/code/resources/app/extensions/theme-seti/icons/vs-seti-icon-theme.json"),
-        ]
-
-        extension_roots = [
-            Path.home() / ".vscode" / "extensions",
-            Path.home() / ".vscode-oss" / "extensions",
-            Path.home() / ".var" / "app" / "com.visualstudio.code" / "data" / "vscode" / "extensions",
-        ]
-        for extension_root in extension_roots:
-            if extension_root.exists():
-                candidates.extend(extension_root.glob("*/icons/*icon-theme.json"))
-                candidates.extend(extension_root.glob("*/*icon-theme.json"))
-
-        return list(dict.fromkeys(candidates))
-
-    def _normalized_icon_map(self, value) -> dict[str, str]:
-        if not isinstance(value, dict):
-            return {}
-        return {str(key).lower(): str(icon_id) for key, icon_id in value.items()}
-
     def _icon_from_path(self, icon_path: Path) -> QIcon | None:
         cache_key = str(icon_path)
         if cache_key in self._file_icon_cache:
@@ -915,58 +863,100 @@ class MainWindow(QMainWindow):
         self._file_icon_cache[cache_key] = icon
         return icon
 
-    def _icon_from_vscode_theme(self, filename: str) -> QIcon | None:
-        theme = self._vscode_icon_theme
-        if theme is None:
-            return None
+    def _material_icon_stems_for_filename(self, filename: str) -> list[str]:
+        normalized = filename.lower()
+        extension = Path(normalized).suffix.lower().lstrip(".")
+        stems: list[str] = []
 
-        normalized_filename = filename.lower()
-        icon_id = theme["file_names"].get(normalized_filename)
+        file_name_map = {
+            ".dockerignore": ["docker"],
+            ".env": ["tune", "settings"],
+            ".gitignore": ["git"],
+            ".prettierrc": ["prettier"],
+            ".python-version": ["python"],
+            "docker-compose.yaml": ["docker"],
+            "docker-compose.yml": ["docker"],
+            "dockerfile": ["docker"],
+            "makefile": ["makefile"],
+            "pyproject.toml": ["python"],
+            "readme": ["readme", "markdown"],
+            "readme.md": ["readme", "markdown"],
+            "requirements.txt": ["python"],
+        }
+        extension_map = {
+            "bat": ["console"],
+            "c": ["c"],
+            "cc": ["cpp"],
+            "cfg": ["settings"],
+            "conf": ["settings"],
+            "cpp": ["cpp"],
+            "cs": ["c-sharp", "csharp"],
+            "css": ["css"],
+            "csv": ["table"],
+            "cxx": ["cpp"],
+            "dockerfile": ["docker"],
+            "env": ["tune", "settings"],
+            "gitignore": ["git"],
+            "go": ["go"],
+            "h": ["h", "c"],
+            "hpp": ["hpp", "cpp"],
+            "html": ["html"],
+            "ini": ["settings"],
+            "ipynb": ["jupyter"],
+            "java": ["java"],
+            "js": ["javascript"],
+            "json": ["json"],
+            "jsx": ["react", "javascript"],
+            "md": ["markdown"],
+            "mdx": ["markdown"],
+            "py": ["python"],
+            "pyi": ["python"],
+            "qml": ["qt"],
+            "rs": ["rust"],
+            "rst": ["document"],
+            "sh": ["console"],
+            "sql": ["database"],
+            "svg": ["svg"],
+            "toml": ["settings", "toml"],
+            "ts": ["typescript"],
+            "tsx": ["react_ts", "react", "typescript"],
+            "txt": ["document"],
+            "ui": ["qt"],
+            "xml": ["xml"],
+            "yaml": ["yaml"],
+            "yml": ["yaml"],
+        }
 
-        parts = normalized_filename.split(".")
-        if icon_id is None and len(parts) > 1:
-            for index in range(1, len(parts)):
-                extension = ".".join(parts[index:])
-                icon_id = theme["file_extensions"].get(extension)
-                if icon_id is not None:
-                    break
+        stems.extend(file_name_map.get(normalized, []))
 
-        if icon_id is None:
-            icon_id = theme.get("default_file")
-        if not isinstance(icon_id, str):
-            return None
-
-        definition = theme["definitions"].get(icon_id)
-        if not isinstance(definition, dict):
-            return None
-
-        icon_path_value = definition.get("iconPath")
-        if not isinstance(icon_path_value, str):
-            return None
-
-        icon_path = Path(icon_path_value)
-        if not icon_path.is_absolute():
-            icon_path = theme["root"] / icon_path
-        return self._icon_from_path(icon_path.resolve())
-
-    def _icon_for_record(self, record) -> QIcon:
-        extension = Path(record.filename).suffix.lower().lstrip(".")
-        icon_dir = Path(__file__).resolve().parent / "icons"
+        if normalized.startswith(".env."):
+            stems.extend(["tune", "settings"])
+        if normalized.startswith("docker-compose."):
+            stems.append("docker")
 
         if extension:
+            stems.extend(extension_map.get(extension, []))
+            stems.append(extension)
+
+        stems.extend(["file", "default_file"])
+        return list(dict.fromkeys(stems))
+
+    def _icon_from_material_icons(self, filename: str) -> QIcon | None:
+        if not self._material_icon_dir.exists():
+            self._log("Material icon directory not found: %s", self._material_icon_dir)
+            return None
+
+        for stem in self._material_icon_stems_for_filename(filename):
             for image_format in ["svg", "png"]:
-                icon = self._icon_from_path(icon_dir / f"{extension}.{image_format}")
+                icon = self._icon_from_path(self._material_icon_dir / f"{stem}.{image_format}")
                 if icon is not None:
                     return icon
+        return None
 
-        icon = self._icon_from_vscode_theme(record.filename)
+    def _icon_for_record(self, record) -> QIcon:
+        icon = self._icon_from_material_icons(record.filename)
         if icon is not None:
             return icon
-
-        for image_format in ["svg", "png"]:
-            icon = self._icon_from_path(icon_dir / f"default.{image_format}")
-            if icon is not None:
-                return icon
 
         return self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon)
 
