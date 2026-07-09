@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QObject, Qt, QThread, Signal, QUrl
-from PySide6.QtGui import QFontDatabase, QIcon, QKeyEvent
+from PySide6.QtGui import QAction, QFontDatabase, QIcon, QKeyEvent, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QFrame,
     QPlainTextEdit,
@@ -124,11 +125,42 @@ class MainWindow(QMainWindow):
         self._file_icon_cache: dict[str, QIcon] = {}
         self._material_icon_dir = Path(__file__).resolve().parent / "icons" / "material-icon-theme" / "icons"
 
+        self._build_menu_bar()
         self._build_ui()
         self._sync_settings_controls()
         if self.input_paths:
             self._log("Loaded %d startup path(s)", len(self.input_paths))
             self.request_rebuild()
+
+    def _build_menu_bar(self) -> None:
+        file_menu = self.menuBar().addMenu("&File")
+
+        self.add_file_action = QAction("Add File...", self)
+        self.add_folder_action = QAction("Add Folder...", self)
+        self.refresh_action = QAction("Refresh", self)
+        self.copy_action = QAction("Copy JSON", self)
+        self.save_session_action = QAction("Save Session", self)
+        self.load_session_action = QAction("Load Session", self)
+        self.export_action = QAction("Export JSON...", self)
+        self.reset_action = QAction("Reset", self)
+        self.settings_action = QAction("Settings", self)
+
+        self.save_session_action.setShortcut(QKeySequence.StandardKey.Save)
+        self.load_session_action.setShortcut(QKeySequence("Ctrl+L"))
+
+        for action in [
+            self.add_file_action,
+            self.add_folder_action,
+            self.refresh_action,
+            self.copy_action,
+            self.save_session_action,
+            self.load_session_action,
+            self.export_action,
+        ]:
+            file_menu.addAction(action)
+        file_menu.addSeparator()
+        file_menu.addAction(self.settings_action)
+        file_menu.addAction(self.reset_action)
 
     def _log(self, message: str, *args: object) -> None:
         if self.verbose:
@@ -142,6 +174,7 @@ class MainWindow(QMainWindow):
         self.import_roots_edit.clear()
         self.include_hidden_check.setChecked(False)
         self.include_unchecked_folder_check.setChecked(False)
+        self.show_skipped_dependencies_check.setChecked(False)
 
     def _apply_styles(self) -> None:
         self.setStyleSheet(
@@ -157,6 +190,23 @@ class MainWindow(QMainWindow):
             }
             QLabel, QGroupBox, QStatusBar {
                 color: #e2e8f0;
+            }
+            QMenuBar {
+                background: #0f172a;
+                color: #e2e8f0;
+                padding: 4px;
+            }
+            QMenuBar::item:selected {
+                background: #1e293b;
+                border-radius: 6px;
+            }
+            QMenu {
+                background: #111827;
+                color: #e5e7eb;
+                border: 1px solid rgba(148, 163, 184, 0.22);
+            }
+            QMenu::item:selected {
+                background: #0ea5e9;
             }
             QFrame#heroCard, QFrame#card {
                 background: rgba(15, 23, 42, 0.88);
@@ -228,6 +278,15 @@ class MainWindow(QMainWindow):
             QPushButton#primaryAction:hover {
                 background: #0284c7;
             }
+            QLabel#overviewSummary {
+                padding: 16px;
+                background: rgba(30, 41, 59, 0.92);
+                border: 1px solid rgba(148, 163, 184, 0.14);
+                border-radius: 14px;
+                color: #e2e8f0;
+                line-height: 1.4;
+                font-size: 11pt;
+            }
             QTreeWidget::item, QTableWidget::item {
                 padding: 6px;
             }
@@ -294,29 +353,19 @@ class MainWindow(QMainWindow):
         title_stack.addWidget(self.input_summary_label)
 
         button_row = QHBoxLayout()
-        self.add_file_button = QPushButton("Add File")
-        self.add_folder_button = QPushButton("Add Folder")
         self.settings_button = QPushButton("Settings")
-        self.refresh_button = QPushButton("Refresh")
+        self.reset_button = QPushButton("Reset")
         self.copy_button = QPushButton("Copy JSON")
-        self.save_session_button = QPushButton("Save Session")
-        self.load_session_button = QPushButton("Load Session")
-        self.export_button = QPushButton("Export JSON")
         for button in [
-            self.add_file_button,
-            self.add_folder_button,
             self.settings_button,
-            self.refresh_button,
+            self.reset_button,
             self.copy_button,
-            self.save_session_button,
-            self.load_session_button,
-            self.export_button,
         ]:
             button_row.addWidget(button)
         button_row.addStretch(1)
         self.copy_button.setObjectName("primaryAction")
         header_layout.addLayout(title_stack, 2)
-        header_layout.addLayout(button_row, 3)
+        header_layout.addLayout(button_row, 1)
 
         self.settings_panel = QFrame()
         self.settings_panel.setObjectName("card")
@@ -348,6 +397,8 @@ class MainWindow(QMainWindow):
         self.include_hidden_check.setCheckable(True)
         self.include_unchecked_folder_check = QPushButton("Keep unchecked folder files in JSON")
         self.include_unchecked_folder_check.setCheckable(True)
+        self.show_skipped_dependencies_check = QPushButton("Show skipped dependencies")
+        self.show_skipped_dependencies_check.setCheckable(True)
         form.addRow("Project root override", self.project_root_edit)
         form.addRow("Import root overrides", self.import_roots_edit)
         form.addRow("Max dependency depth", self.max_depth_spin)
@@ -355,21 +406,8 @@ class MainWindow(QMainWindow):
         form.addRow("Truncation size", self.truncation_spin)
         form.addRow(self.include_hidden_check)
         form.addRow(self.include_unchecked_folder_check)
+        form.addRow(self.show_skipped_dependencies_check)
         settings_layout.addLayout(form)
-
-        top_controls = QHBoxLayout()
-        self.remove_button = QPushButton("Remove Selected")
-        self.include_full_button = QPushButton("Include Full")
-        self.include_truncated_button = QPushButton("Include Truncated")
-        self.exclude_button = QPushButton("Exclude")
-        for button in [
-            self.remove_button,
-            self.include_full_button,
-            self.include_truncated_button,
-            self.exclude_button,
-        ]:
-            top_controls.addWidget(button)
-        top_controls.addStretch(1)
 
         root_layout.addWidget(header)
         root_layout.addWidget(self.settings_panel)
@@ -379,7 +417,6 @@ class MainWindow(QMainWindow):
         left_layout = QVBoxLayout(left_container)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(10)
-        left_layout.addLayout(top_controls)
         self.views = QTabWidget()
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["Context tree", "Type", "Size"])
@@ -389,6 +426,8 @@ class MainWindow(QMainWindow):
         self.tree.setSelectionMode(QAbstractItemView.SingleSelection)
         self.tree.setDragEnabled(True)
         self.tree.installEventFilter(self)
+        self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self._show_tree_context_menu)
 
         flat_container = QWidget()
         flat_layout = QVBoxLayout(flat_container)
@@ -405,7 +444,11 @@ class MainWindow(QMainWindow):
         self.flat_table.setColumnWidth(0, 560)
         self.flat_table.setColumnWidth(1, 160)
         self.flat_table.setColumnWidth(2, 110)
+        self.flat_table.setColumnWidth(4, 90)
         self.flat_table.itemSelectionChanged.connect(self.on_table_selection_changed)
+        self.flat_table.itemChanged.connect(self.on_table_item_changed)
+        self.flat_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.flat_table.customContextMenuRequested.connect(self._show_table_context_menu)
         self.flat_table.installEventFilter(self)
         flat_layout.addWidget(self.search_edit)
         flat_layout.addWidget(self.flat_table, 1)
@@ -432,10 +475,11 @@ class MainWindow(QMainWindow):
 
         overview_page = QWidget()
         overview_layout = QVBoxLayout(overview_page)
-        self.bundle_summary = QPlainTextEdit()
-        self.bundle_summary.setReadOnly(True)
-        self.bundle_summary.setPlaceholderText("Bundle summary will appear here after a scan.")
-        overview_layout.addWidget(self.bundle_summary)
+        self.bundle_summary = QLabel("Bundle summary will appear here after a scan.")
+        self.bundle_summary.setObjectName("overviewSummary")
+        self.bundle_summary.setWordWrap(True)
+        self.bundle_summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        overview_layout.addWidget(self.bundle_summary, 1)
         self.preview_tabs.addTab(overview_page, "Overview")
 
         task_card = QFrame()
@@ -508,18 +552,19 @@ class MainWindow(QMainWindow):
         footer.addWidget(self.cancel_button)
         root_layout.addLayout(footer)
 
-        self.add_file_button.clicked.connect(self.add_files)
-        self.add_folder_button.clicked.connect(self.add_folder)
+        self.add_file_action.triggered.connect(lambda: self.add_files())
+        self.add_folder_action.triggered.connect(lambda: self.add_folder())
+        self.refresh_action.triggered.connect(lambda: self.request_rebuild())
+        self.copy_action.triggered.connect(lambda: self.copy_json())
+        self.save_session_action.triggered.connect(lambda: self.save_session())
+        self.load_session_action.triggered.connect(lambda: self.load_session())
+        self.export_action.triggered.connect(lambda: self.export_json())
+        self.reset_action.triggered.connect(lambda: self.reset_session())
+        self.settings_action.triggered.connect(lambda: self.toggle_settings_panel())
         self.settings_button.clicked.connect(self.toggle_settings_panel)
-        self.remove_button.clicked.connect(self.remove_selected)
-        self.include_full_button.clicked.connect(self.include_full_selected)
-        self.include_truncated_button.clicked.connect(self.include_truncated_selected)
-        self.exclude_button.clicked.connect(self.exclude_selected)
-        self.refresh_button.clicked.connect(self.request_rebuild)
+        self.reset_button.clicked.connect(self.reset_session)
         self.copy_button.clicked.connect(self.copy_json)
-        self.save_session_button.clicked.connect(self.save_session)
-        self.load_session_button.clicked.connect(self.load_session)
-        self.export_button.clicked.connect(self.export_json)
+        self.show_skipped_dependencies_check.clicked.connect(self._on_show_skipped_dependencies_changed)
 
         self._apply_default_settings()
         self._apply_styles()
@@ -544,7 +589,11 @@ class MainWindow(QMainWindow):
     def toggle_settings_panel(self) -> None:
         self.settings_panel.setVisible(not self.settings_panel.isVisible())
         self.settings_button.setText("Hide Settings" if self.settings_panel.isVisible() else "Settings")
+        self.settings_action.setText("Hide Settings" if self.settings_panel.isVisible() else "Settings")
         self._log("Settings panel %s", "opened" if self.settings_panel.isVisible() else "hidden")
+
+    def _on_show_skipped_dependencies_changed(self) -> None:
+        self.refresh_tree()
 
     def _reset_settings_defaults(self) -> None:
         self._apply_default_settings()
@@ -604,6 +653,31 @@ class MainWindow(QMainWindow):
             file_overrides=dict(self.file_overrides),
         )
 
+    def reset_session(self) -> None:
+        if self._worker is not None:
+            self._pending_rebuild = False
+            self.cancel_build()
+        self.input_paths.clear()
+        self.file_overrides.clear()
+        self.workspace = None
+        self.current_result = None
+        self.selected_file_id = None
+        self.user_prompt_edit.clear()
+        self.custom_system_prompt.clear()
+        default_template_index = self.system_template_combo.findData("code_editing")
+        if default_template_index >= 0:
+            self.system_template_combo.setCurrentIndex(default_template_index)
+        self._apply_default_settings()
+        self.tree.clear()
+        self.flat_table.setRowCount(0)
+        self.preview.clear()
+        self.detail_label.setText("Add a file or folder to begin.")
+        self.bundle_summary.clear()
+        self._update_input_summary()
+        self._update_token_count(0, 0)
+        self.status_label.setText("Ready.")
+        self.statusBar().showMessage("Reset complete")
+
     def request_rebuild(self) -> None:
         if not self.input_paths:
             self.workspace = None
@@ -655,16 +729,22 @@ class MainWindow(QMainWindow):
         self._worker_thread.start()
 
     def _set_controls_enabled(self, enabled: bool) -> None:
+        for action in [
+            self.add_file_action,
+            self.add_folder_action,
+            self.refresh_action,
+            self.copy_action,
+            self.save_session_action,
+            self.load_session_action,
+            self.export_action,
+            self.reset_action,
+            self.settings_action,
+        ]:
+            action.setEnabled(enabled)
         for widget in [
-            self.add_file_button,
-            self.add_folder_button,
             self.settings_button,
-            self.remove_button,
-            self.refresh_button,
+            self.reset_button,
             self.copy_button,
-            self.save_session_button,
-            self.load_session_button,
-            self.export_button,
             self.reset_settings_button,
             self.project_root_edit,
             self.import_roots_edit,
@@ -673,6 +753,7 @@ class MainWindow(QMainWindow):
             self.truncation_spin,
             self.include_hidden_check,
             self.include_unchecked_folder_check,
+            self.show_skipped_dependencies_check,
             self.user_prompt_edit,
             self.system_template_combo,
             self.custom_system_prompt,
@@ -747,20 +828,21 @@ class MainWindow(QMainWindow):
         json_chars = len(result.json_text)
         estimated_tokens = self._estimate_tokens(result.json_text)
         self._update_token_count(estimated_tokens, json_bytes)
-        self.bundle_summary.setPlainText(
-            "\n".join(
-                [
-                    f"Files: {file_count}",
-                    f"Dependency groups: {graph_groups}",
-                    f"Linked files: {linked_files}",
-                    f"JSON chars: {json_chars:,}",
-                    f"JSON bytes: {json_bytes:,}",
-                    f"Estimated JSON tokens: {estimated_tokens:,}",
-                    f"System prompt chars: {len(bundle['system_prompt']):,}",
-                    f"LLM task chars: {len(bundle['llm_task']):,}",
-                    f"User prompt chars: {len(bundle['user_prompt']):,}",
-                ]
-            )
+        self.bundle_summary.setText(
+            f"""
+            <h2 style="margin: 0 0 12px 0;">Bundle overview</h2>
+            <table cellspacing="0" cellpadding="6">
+              <tr><td><b>Files</b></td><td>{file_count:,}</td></tr>
+              <tr><td><b>Dependency groups</b></td><td>{graph_groups:,}</td></tr>
+              <tr><td><b>Linked files</b></td><td>{linked_files:,}</td></tr>
+              <tr><td><b>JSON characters</b></td><td>{json_chars:,}</td></tr>
+              <tr><td><b>JSON bytes</b></td><td>{json_bytes:,}</td></tr>
+              <tr><td><b>Estimated JSON tokens</b></td><td>{estimated_tokens:,}</td></tr>
+              <tr><td><b>System prompt characters</b></td><td>{len(bundle["system_prompt"]):,}</td></tr>
+              <tr><td><b>LLM task characters</b></td><td>{len(bundle["llm_task"]):,}</td></tr>
+              <tr><td><b>User prompt characters</b></td><td>{len(bundle["user_prompt"]):,}</td></tr>
+            </table>
+            """
         )
 
     def _estimate_tokens(self, text: str) -> int:
@@ -817,13 +899,24 @@ class MainWindow(QMainWindow):
             self.tree.clear()
             for node in self.workspace.tree_roots:
                 item = self._build_tree_item(node)
+                if item is None:
+                    continue
                 self.tree.addTopLevelItem(item)
                 item.setExpanded(True)
             self.tree.resizeColumnToContents(0)
         finally:
             self._refreshing_tree = False
 
-    def _build_tree_item(self, node: TreeNode) -> QTreeWidgetItem:
+    def _should_show_tree_node(self, node: TreeNode) -> bool:
+        if node.kind == "skipped" and not self.show_skipped_dependencies_check.isChecked():
+            return False
+        if node.file_id:
+            return True
+        return any(self._should_show_tree_node(child) for child in node.children) if node.children else True
+
+    def _build_tree_item(self, node: TreeNode) -> QTreeWidgetItem | None:
+        if not self._should_show_tree_node(node):
+            return None
         item = QTreeWidgetItem([node.label, node.kind, ""])
         record = None
         if node.file_id:
@@ -837,7 +930,9 @@ class MainWindow(QMainWindow):
         else:
             item.setData(0, Qt.UserRole, None)
         for child in node.children:
-            item.addChild(self._build_tree_item(child))
+            child_item = self._build_tree_item(child)
+            if child_item is not None:
+                item.addChild(child_item)
         if node.kind == "folder":
             item.setIcon(0, self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon))
         elif node.kind == "skipped":
@@ -1000,12 +1095,17 @@ class MainWindow(QMainWindow):
             QTableWidgetItem(record.context_type),
             QTableWidgetItem(record.inclusion_mode),
             QTableWidgetItem(self._format_size(record.size_bytes)),
-            QTableWidgetItem("yes" if record.included else "no"),
+            QTableWidgetItem(),
             QTableWidgetItem(record.source_kind),
         ]
         items[0].setIcon(self._icon_for_record(record))
+        items[4].setCheckState(Qt.Checked if record.included else Qt.Unchecked)
         for col, item in enumerate(items):
             item.setData(Qt.UserRole, record.id)
+            if col == 4:
+                item.setFlags((item.flags() | Qt.ItemIsUserCheckable) & ~Qt.ItemIsEditable)
+            else:
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
             if record.is_dependency:
                 item.setForeground(Qt.gray)
             self.flat_table.setItem(row, col, item)
@@ -1051,6 +1151,58 @@ class MainWindow(QMainWindow):
         if isinstance(file_id, str):
             self.selected_file_id = file_id
             self.show_record(file_id)
+
+    def on_table_item_changed(self, item: QTableWidgetItem) -> None:
+        if self._refreshing_table or item.column() != 4:
+            return
+        file_id = item.data(Qt.UserRole)
+        if not isinstance(file_id, str):
+            return
+        self.selected_file_id = file_id
+        self.flat_table.selectRow(item.row())
+        if item.checkState() == Qt.Checked:
+            self._set_file_mode(file_id, "full")
+        else:
+            self._set_file_mode(file_id, "excluded")
+
+    def _show_tree_context_menu(self, position) -> None:
+        item = self.tree.itemAt(position)
+        if item is None:
+            return
+        self.tree.setCurrentItem(item)
+        file_id = item.data(0, Qt.UserRole)
+        if not isinstance(file_id, str):
+            return
+        self._show_file_context_menu(file_id, self.tree.viewport().mapToGlobal(position))
+
+    def _show_table_context_menu(self, position) -> None:
+        row = self.flat_table.rowAt(position.y())
+        if row < 0:
+            return
+        self.flat_table.selectRow(row)
+        item = self.flat_table.item(row, 0)
+        file_id = item.data(Qt.UserRole) if item is not None else None
+        if not isinstance(file_id, str):
+            return
+        self._show_file_context_menu(file_id, self.flat_table.viewport().mapToGlobal(position))
+
+    def _show_file_context_menu(self, file_id: str, global_position) -> None:
+        self.selected_file_id = file_id
+        menu = QMenu(self)
+        include_full_action = menu.addAction("Include full")
+        include_truncated_action = menu.addAction("Include truncated")
+        exclude_action = menu.addAction("Exclude")
+        menu.addSeparator()
+        remove_action = menu.addAction("Remove selected")
+        chosen_action = menu.exec(global_position)
+        if chosen_action == include_full_action:
+            self.include_full_selected()
+        elif chosen_action == include_truncated_action:
+            self.include_truncated_selected()
+        elif chosen_action == exclude_action:
+            self.exclude_selected()
+        elif chosen_action == remove_action:
+            self.remove_selected()
 
     def show_record(self, file_id: str) -> None:
         if self.workspace is None or file_id not in self.workspace.files:
@@ -1222,7 +1374,10 @@ class MainWindow(QMainWindow):
                 },
                 "user_prompt": self.user_prompt_edit.toPlainText(),
             },
-            settings=asdict(self.current_settings()),
+            settings={
+                **asdict(self.current_settings()),
+                "show_skipped_dependencies": self.show_skipped_dependencies_check.isChecked(),
+            },
             file_overrides=dict(self.file_overrides),
         )
         Path(path).write_text(json.dumps(asdict(state), indent=2, ensure_ascii=False), encoding="utf-8")
@@ -1251,6 +1406,7 @@ class MainWindow(QMainWindow):
         self.truncation_spin.setValue(int(settings.get("truncation_size", 40 * 1024)))
         self.include_hidden_check.setChecked(bool(settings.get("include_hidden", False)))
         self.include_unchecked_folder_check.setChecked(bool(settings.get("include_unchecked_folder_files", False)))
+        self.show_skipped_dependencies_check.setChecked(bool(settings.get("show_skipped_dependencies", False)))
         self.file_overrides = dict(payload.get("file_overrides", {}))
         self._update_input_summary()
         self.status_label.setText(f"Loaded session from {path}.")
