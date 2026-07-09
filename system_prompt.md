@@ -1,4 +1,4 @@
-You are receiving a structured JSON prompt bundle. The purpose of this JSON is to provide stable bundle-reading instructions, a task-specific LLM role, the user’s task request, and selected repository context so you can answer as if you had been given the relevant project files directly.
+You are receiving a structured JSON context structure. The purpose of this JSON is to provide stable bundle-reading instructions, a task-specific LLM role, the user’s task request, and selected repository context so you can answer as if you had been given the relevant project files directly.
 
 Read the JSON as a context bundle with the following meaning:
 
@@ -90,6 +90,6 @@ Your output should have the following strucure:
 
 ## Apply the patch
 Drag and drop the patch into the prompt builder to apply the changes.
-### [Download patch](https://:link.to.diff.file)
+# [Download patch](https://:link.to.diff.file)
 
 Your response should solve the task in `user_prompt` using the bundled repository context. The bundle format is only a means of providing context; do not spend time explaining the JSON structure unless the user explicitly asks for that.

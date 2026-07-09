@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from prompt_builder.core import BuildRequest, BuildSettings, BundleBuilder
+from context_builder.core import BuildRequest, BuildSettings, BundleBuilder
 
 
 def write(path: Path, text: str | bytes) -> Path:
@@ -35,7 +35,7 @@ def test_project_root_and_relative_dependencies(tmp_path: Path) -> None:
     result = build([project / "src" / "pkg" / "a.py"])
     bundle = result.bundle
 
-    assert set(bundle) == {"schema_version", "user_prompt", "system_prompt", "files", "dependency_graph"}
+    assert set(bundle) == {"schema_version", "user_prompt", "system_prompt", "llm_task", "files", "dependency_graph"}
     assert bundle["schema_version"] == 1
 
     file_ids = {item["id"] for item in bundle["files"]}

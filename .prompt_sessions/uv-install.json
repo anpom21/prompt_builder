@@ -1,0 +1,38 @@
+{
+  "input_paths": [
+    "/home/ap/Repositories/Context_Builder/main.py",
+    "/home/ap/Repositories/Context_Builder/README.md",
+    "/home/ap/Repositories/Context_Builder"
+  ],
+  "prompt": {
+    "llm_task": {
+      "mode": "template",
+      "template_id": "code_editing",
+      "custom_text": ""
+    },
+    "user_prompt": "Im rebranding Prompt Builder to Context Builder instead, make sure that change is applied everywhere. \n\nRename the prompt_builder folder to src/ so it follows a more python package strict strucuture other suggestion is also welcome. Are svg better for ubuntu app logos? In that case instead use the logo.svg in the same folder as the png.\n\nAdd uv install and sync to the install script if it is not installed. Also download the icons described in the readme.md\n\nUSE the modern python layout:\nI'd recommend the modern Python layout:\n\ncontext_builder/\n├── pyproject.toml\n├── README.md\n├── main.py           # optional launcher\n├── src/\n│   └── context_builder/\n│       ├── __init__.py\n│       ├── core.py\n│       ├── ui.py\n│       ├── icons/\n│       └── ...\n\nwith\n\n[tool.uv]\n...\n\n[project]\nname = \"context-builder\"\n\nand\n\nfrom context_builder.ui import launch_app\n\ninstead of\n\nfrom prompt_builder.ui import launch_app\n\nInstead of\n\nPrompt bundle\n\nI'd consistently use\n\nContext structure"
+  },
+  "settings": {
+    "max_dependency_depth": 5,
+    "large_file_threshold": 262144,
+    "truncation_size": 40960,
+    "project_root_override": "",
+    "import_root_overrides": [],
+    "include_unchecked_folder_files": false,
+    "include_hidden": false,
+    "show_skipped_dependencies": false,
+    "autosave_enabled": true
+  },
+  "file_overrides": {
+    "README.md": "full",
+    "notion_mvp.py": "excluded",
+    "python_prompt_builder_spec.md": "excluded",
+    "src/context_builder.egg-info/SOURCES.txt": "excluded",
+    "src/context_builder.egg-info/dependency_links.txt": "excluded",
+    "src/context_builder.egg-info/entry_points.txt": "excluded",
+    "src/context_builder.egg-info/requires.txt": "excluded",
+    "src/context_builder.egg-info/top_level.txt": "full",
+    "src/context_builder/icons/README.md": "excluded"
+  },
+  "session_file": "/home/ap/Repositories/Context_Builder/.prompt_sessions/uv-install.json"
+}

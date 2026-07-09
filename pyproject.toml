@@ -1,7 +1,11 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
 [project]
-name = "prompt-builder"
+name = "context-builder"
 version = "0.1.0"
-description = "PySide prompt builder for Python context bundles"
+description = "PySide context builder for repository-aware JSON context structures"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -14,4 +18,13 @@ dependencies = [
 ]
 
 [project.scripts]
-prompt-builder = "main:main"
+context-builder = "context_builder.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+context_builder = ["icons/**/*.svg", "icons/**/*.png", "logo.svg", "logo.png"]
+
+[tool.uv]
+package = true

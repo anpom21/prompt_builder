@@ -368,7 +368,7 @@ class BundleBuilder:
         return BuildResult(workspace=workspace, bundle=bundle, json_text=json_text)
 
 
-def build_prompt_bundle(
+def build_context_structure(
     request: BuildRequest,
     progress: ProgressCallback | None = None,
     should_cancel: CancelCallback | None = None,
@@ -376,8 +376,16 @@ def build_prompt_bundle(
     return BundleBuilder().build(request, progress=progress, should_cancel=should_cancel)
 
 
+def build_prompt_bundle(
+    request: BuildRequest,
+    progress: ProgressCallback | None = None,
+    should_cancel: CancelCallback | None = None,
+) -> BuildResult:
+    return build_context_structure(request, progress=progress, should_cancel=should_cancel)
+
+
 def load_system_prompt() -> str:
-    prompt_path = Path(__file__).resolve().parent.parent / SYSTEM_PROMPT_FILENAME
+    prompt_path = Path(__file__).resolve().parent.parent.parent / SYSTEM_PROMPT_FILENAME
     try:
         prompt_text = prompt_path.read_text(encoding="utf-8").strip()
     except OSError as exc:

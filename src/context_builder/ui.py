@@ -59,13 +59,13 @@ from .core import (
     PromptTemplateMode,
     LLM_TASK_TEMPLATES,
     TreeNode,
-    build_prompt_bundle,
+    build_context_structure,
     serialize_bundle,
 )
 
 logger = logging.getLogger(__name__)
 
-SESSION_DIR_NAME = ".prompt_sessions"
+SESSION_DIR_NAME = ".context_sessions"
 
 
 @dataclass(slots=True)
@@ -93,7 +93,7 @@ class BuildWorker(QObject):
     def run(self) -> None:
         logger.info("Starting background build for %d input path(s)", len(self._request.input_paths))
         try:
-            result = build_prompt_bundle(
+            result = build_context_structure(
                 self._request,
                 progress=lambda message, current, total: self.progress.emit(message, current, total),
                 should_cancel=lambda: self._cancelled,
@@ -164,7 +164,7 @@ class MainWindow(QMainWindow):
         session_path: str | None = None,
     ) -> None:
         super().__init__()
-        self.setWindowTitle("Prompt Builder")
+        self.setWindowTitle("Context Builder")
         self._set_application_icon()
         self.resize(1500, 950)
         self.setAcceptDrops(True)
@@ -215,7 +215,10 @@ class MainWindow(QMainWindow):
             self.request_rebuild()
 
     def _set_application_icon(self) -> None:
-        logo_path = Path(__file__).resolve().parent / "logo.png"
+        package_dir = Path(__file__).resolve().parent
+        logo_path = package_dir / "logo.svg"
+        if not logo_path.exists():
+            logo_path = package_dir / "logo.png"
         if not logo_path.exists():
             return
 
@@ -234,7 +237,7 @@ class MainWindow(QMainWindow):
         self.add_file_action = QAction("Add File...", self)
         self.add_folder_action = QAction("Add Folder...", self)
         self.refresh_action = QAction("Refresh", self)
-        self.copy_action = QAction("Copy Prompt", self)
+        self.copy_action = QAction("Copy Context", self)
         self.new_session_action = QAction("New Session", self)
         self.save_session_action = QAction("Save Session", self)
         self.save_session_as_action = QAction("Save Session As...", self)
@@ -319,7 +322,7 @@ class MainWindow(QMainWindow):
         return self._session_dir / f"{self._safe_session_name(prefix)}-{timestamp}.json"
 
     def _build_sessions_dock(self) -> None:
-        self.sessions_dock = QDockWidget("Prompt Sessions", self)
+        self.sessions_dock = QDockWidget("Context Sessions", self)
         self.sessions_dock.setObjectName("sessionsDock")
         self.sessions_dock.setAllowedAreas(Qt.RightDockWidgetArea)
         self.sessions_dock.setFeatures(
@@ -333,7 +336,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(10)
 
-        heading = QLabel("Prompt Sessions")
+        heading = QLabel("Context Sessions")
         heading.setObjectName("sectionLabel")
         hint = QLabel("Sessions are stored in the current repository under .prompt_sessions/. Double-click a session to switch.")
         hint.setObjectName("hintLabel")
@@ -878,9 +881,9 @@ class MainWindow(QMainWindow):
         header_layout.setSpacing(14)
 
         title_stack = QVBoxLayout()
-        title = QLabel("Prompt Builder")
+        title = QLabel("Context Builder")
         title.setObjectName("titleLabel")
-        subtitle = QLabel("Build a lean, repo-aware prompt bundle from files or folders.")
+        subtitle = QLabel("Build a lean, repo-aware context structure from files or folders.")
         subtitle.setObjectName("subtitleLabel")
         self.input_summary_label = QLabel("No inputs loaded yet.")
         self.input_summary_label.setObjectName("inputSummaryLabel")
@@ -898,7 +901,7 @@ class MainWindow(QMainWindow):
         self.reset_button = QPushButton("Reset")
         self.sessions_button = QPushButton("☰")
         self.sessions_button.setObjectName("iconButton")
-        self.sessions_button.setToolTip("Show prompt sessions")
+        self.sessions_button.setToolTip("Show context sessions")
         self.sessions_button.setFixedWidth(46)
         button_row.addWidget(self.settings_button)
         button_row.addWidget(self.reset_button)
@@ -1075,7 +1078,7 @@ class MainWindow(QMainWindow):
         self.copy_banner = QLabel("")
         self.copy_banner.setObjectName("copyBanner")
         self.copy_banner.setVisible(False)
-        self.copy_button = QPushButton("Copy Prompt")
+        self.copy_button = QPushButton("Copy Context")
         self.copy_button.setObjectName("primaryAction")
         self.copy_button.setMinimumHeight(46)
         self.copy_button.setMinimumWidth(190)
@@ -1102,7 +1105,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(False)
-        self.token_count_label = QLabel("Total prompt tokens: 0")
+        self.token_count_label = QLabel("Estimated context tokens: 0")
         self.token_count_label.setObjectName("tokenTotal")
         self.token_count_label.setAlignment(Qt.AlignCenter)
         self.token_bar = TokenBarWidget()
@@ -1507,7 +1510,7 @@ class MainWindow(QMainWindow):
 
     def _token_breakdown_html(self, breakdown: dict[str, int], total_tokens: int) -> str:
         if total_tokens <= 0:
-            return "No prompt bundle has been built yet."
+            return "No context structure has been built yet."
 
         palette = self._token_palette()
         detail_parts = []
@@ -1547,10 +1550,10 @@ class MainWindow(QMainWindow):
         elif json_bytes is None:
             json_bytes = len(self.current_result.json_text.encode("utf-8")) if self.current_result else 0
 
-        self.token_count_label.setText(f"Total prompt tokens: {estimated_tokens:,}")
+        self.token_count_label.setText(f"Estimated context tokens: {estimated_tokens:,}")
         if self.current_result is None:
             self.token_bar.set_breakdown({}, 0, self._token_palette())
-            self.token_breakdown_label.setText("No prompt bundle has been built yet.")
+            self.token_breakdown_label.setText("No context structure has been built yet.")
         else:
             breakdown = self._token_breakdown(self.current_result.bundle, estimated_tokens)
             self.token_bar.set_breakdown(breakdown, estimated_tokens, self._token_palette())
@@ -2126,12 +2129,12 @@ class MainWindow(QMainWindow):
         text = serialize_bundle(bundle)
         token_count = self._estimate_tokens(text)
         QApplication.clipboard().setText(text)
-        self._log("Copied prompt bundle to clipboard (%d bytes)", len(text.encode("utf-8")))
+        self._log("Copied context structure to clipboard (%d bytes)", len(text.encode("utf-8")))
         self.copy_banner.setText(f"Copied to clipboard ({token_count:,} tokens)")
         self.copy_banner.setVisible(True)
         QTimer.singleShot(5000, lambda: self.copy_banner.setVisible(False))
-        self.status_label.setText("Prompt copied to clipboard.")
-        self.statusBar().showMessage("Prompt bundle copied to clipboard")
+        self.status_label.setText("Context copied to clipboard.")
+        self.statusBar().showMessage("Context structure copied to clipboard")
 
     def export_json(self) -> None:
         bundle = self._build_current_bundle()
@@ -2170,14 +2173,14 @@ class MainWindow(QMainWindow):
 
         name, accepted = QInputDialog.getText(
             self,
-            "Name Prompt Session",
+            "Name Context Session",
             "Session name:",
             text=suggested_name,
         )
         if not accepted:
             return None
         if not name.strip():
-            QMessageBox.information(self, "Session name required", "Enter a name for this prompt session.")
+            QMessageBox.information(self, "Session name required", "Enter a name for this context session.")
             return None
 
         safe_name = self._safe_session_name(name)
@@ -2205,7 +2208,7 @@ class MainWindow(QMainWindow):
             self,
             "Save Session As",
             str(suggested),
-            "Prompt Session (*.json)",
+            "Context Session (*.json)",
         )
         if not path:
             return
@@ -2219,7 +2222,7 @@ class MainWindow(QMainWindow):
             self,
             "Load Session",
             str(self._session_dir),
-            "Prompt Session (*.json)",
+            "Context Session (*.json)",
         )
         if not path:
             return
@@ -2272,7 +2275,7 @@ class MainWindow(QMainWindow):
     def _choose_patch_drop_action(self, patch_path: Path) -> str:
         message_box = QMessageBox(self)
         message_box.setWindowTitle("Patch file dropped")
-        message_box.setText(f"How should Prompt Builder handle {patch_path.name}?")
+        message_box.setText(f"How should Context Builder handle {patch_path.name}?")
         message_box.setInformativeText(
             "Apply it as a patch to the current workspace, or import it as a normal context file."
         )
@@ -2306,7 +2309,7 @@ class MainWindow(QMainWindow):
     def _choose_session_drop_action(self, session_path: Path) -> str:
         message_box = QMessageBox(self)
         message_box.setWindowTitle("Session file dropped")
-        message_box.setText(f"Open {session_path.name} as a Prompt Builder session?")
+        message_box.setText(f"Open {session_path.name} as a Context Builder session?")
         message_box.setInformativeText(
             "Open it as the active session, or import it as a normal context file."
         )
@@ -2372,7 +2375,7 @@ class MainWindow(QMainWindow):
                 "Patch matches loaded file state",
                 (
                     "This patch does not apply to the current workspace, but it does apply "
-                    "after restoring the files currently loaded in Prompt Builder.\n\n"
+                    "after restoring the files currently loaded in Context Builder.\n\n"
                     "That usually means the workspace files changed after the prompt was created.\n\n"
                     "Overwrite the loaded workspace files with their older loaded state and then apply the patch?"
                 ),
@@ -2440,7 +2443,7 @@ class MainWindow(QMainWindow):
         if self.workspace is None:
             return False, "No workspace is loaded."
         try:
-            with tempfile.TemporaryDirectory(prefix="prompt-builder-patch-") as temp_dir:
+            with tempfile.TemporaryDirectory(prefix="context-builder-patch-") as temp_dir:
                 temp_root = Path(temp_dir) / "workspace"
                 self._copy_workspace_for_patch_check(temp_root)
                 self._overwrite_loaded_files(temp_root)
@@ -2459,9 +2462,9 @@ class MainWindow(QMainWindow):
     def _ask_restart_after_patch_apply(self) -> bool:
         answer = QMessageBox.question(
             self,
-            "Restart Prompt Builder?",
+            "Restart Context Builder?",
             (
-                "Patch applied successfully. Restart Prompt Builder now to apply the changes?\n\n"
+                "Patch applied successfully. Restart Context Builder now to apply the changes?\n\n"
                 "The current session will be saved and reopened after restart."
             ),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -2549,10 +2552,10 @@ def launch_app(
     verbose: bool = False,
     session_path: str | None = None,
 ) -> int:
-    app = QApplication.instance() or QApplication(["prompt-builder"])
-    app.setApplicationName("prompt-builder")
-    app.setApplicationDisplayName("Prompt Builder")
-    app.setDesktopFileName("prompt-builder")
+    app = QApplication.instance() or QApplication(["context-builder"])
+    app.setApplicationName("context-builder")
+    app.setApplicationDisplayName("Context Builder")
+    app.setDesktopFileName("context-builder")
     window = MainWindow(default_paths=default_paths, verbose=verbose, session_path=session_path)
     window.show()
     return app.exec()
