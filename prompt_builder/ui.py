@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import logging
 import json
+import shutil
+import subprocess
+import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QObject, Qt, QThread, Signal, QUrl
-from PySide6.QtGui import QAction, QFontDatabase, QIcon, QKeyEvent, QKeySequence
+from PySide6.QtCore import QEvent, QObject, Qt, QThread, QTimer, Signal, QUrl
+from PySide6.QtGui import QAction, QColor, QFontDatabase, QIcon, QKeyEvent, QKeySequence, QPainter
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -104,6 +107,46 @@ class BuildWorker(QObject):
             self.failed.emit(str(exc))
 
 
+class TokenBarWidget(QWidget):
+    def __init__(self) -> None:
+        super().__init__()
+        self._entries: list[tuple[str, int, str]] = []
+        self._total_tokens = 0
+        self.setMinimumHeight(14)
+        self.setMaximumHeight(14)
+
+    def set_breakdown(self, breakdown: dict[str, int], total_tokens: int, palette: dict[str, str]) -> None:
+        self._entries = [
+            (label, tokens, palette.get(label, "#64748b"))
+            for label, tokens in breakdown.items()
+            if tokens > 0
+        ]
+        self._total_tokens = max(0, total_tokens)
+        self.update()
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        painter = QPainter(self)
+        rect = self.rect().adjusted(0, 1, 0, -1)
+        painter.fillRect(rect, QColor("#1e293b"))
+
+        if not self._entries or self._total_tokens <= 0 or rect.width() <= 0:
+            return
+
+        x = rect.x()
+        remaining_width = rect.width()
+        for index, (_label, tokens, color) in enumerate(self._entries):
+            if remaining_width <= 0:
+                break
+            if index == len(self._entries) - 1:
+                width = remaining_width
+            else:
+                width = round(rect.width() * (tokens / self._total_tokens))
+                width = max(1, min(width, remaining_width))
+            painter.fillRect(x, rect.y(), width, rect.height(), QColor(color))
+            x += width
+            remaining_width -= width
+
+
 class MainWindow(QMainWindow):
     def __init__(self, default_paths: list[str] | None = None, verbose: bool = False) -> None:
         super().__init__()
@@ -138,7 +181,7 @@ class MainWindow(QMainWindow):
         self.add_file_action = QAction("Add File...", self)
         self.add_folder_action = QAction("Add Folder...", self)
         self.refresh_action = QAction("Refresh", self)
-        self.copy_action = QAction("Copy JSON", self)
+        self.copy_action = QAction("Copy Prompt", self)
         self.save_session_action = QAction("Save Session", self)
         self.load_session_action = QAction("Load Session", self)
         self.export_action = QAction("Export JSON...", self)
@@ -274,9 +317,36 @@ class MainWindow(QMainWindow):
                 color: white;
                 border: none;
                 font-weight: 700;
+                font-size: 12pt;
+                padding: 12px 20px;
             }
             QPushButton#primaryAction:hover {
                 background: #0284c7;
+            }
+            QLabel#copyBanner {
+                padding: 6px 10px;
+                background: rgba(14, 165, 233, 0.18);
+                border: 1px solid rgba(56, 189, 248, 0.35);
+                border-radius: 8px;
+                color: #e0f2fe;
+                font-weight: 700;
+            }
+            QLabel#tokenTotal {
+                font-size: 18px;
+                font-weight: 800;
+                color: #f8fafc;
+            }
+            QLabel#tokenBreakdown {
+                color: #cbd5e1;
+                font-size: 9pt;
+            }
+            QLabel#loadedStats {
+                padding: 10px 12px;
+                background: rgba(30, 41, 59, 0.92);
+                border: 1px solid rgba(148, 163, 184, 0.14);
+                border-radius: 12px;
+                color: #e2e8f0;
+                line-height: 1.35;
             }
             QLabel#overviewSummary {
                 padding: 16px;
@@ -352,19 +422,20 @@ class MainWindow(QMainWindow):
         title_stack.addWidget(subtitle)
         title_stack.addWidget(self.input_summary_label)
 
+        self.loaded_stats_label = QLabel("No project loaded yet.")
+        self.loaded_stats_label.setObjectName("loadedStats")
+        self.loaded_stats_label.setWordWrap(True)
+        self.loaded_stats_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+
         button_row = QHBoxLayout()
         self.settings_button = QPushButton("Settings")
         self.reset_button = QPushButton("Reset")
-        self.copy_button = QPushButton("Copy JSON")
-        for button in [
-            self.settings_button,
-            self.reset_button,
-            self.copy_button,
-        ]:
-            button_row.addWidget(button)
+        button_row.addWidget(self.settings_button)
+        button_row.addWidget(self.reset_button)
         button_row.addStretch(1)
-        self.copy_button.setObjectName("primaryAction")
+
         header_layout.addLayout(title_stack, 2)
+        header_layout.addWidget(self.loaded_stats_label, 3)
         header_layout.addLayout(button_row, 1)
 
         self.settings_panel = QFrame()
@@ -419,7 +490,7 @@ class MainWindow(QMainWindow):
         left_layout.setSpacing(10)
         self.views = QTabWidget()
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["Context tree", "Type", "Size"])
+        self.tree.setHeaderLabels(["Context tree", "Size"])
         self.tree.itemSelectionChanged.connect(self.on_tree_selection_changed)
         self.tree.itemChanged.connect(self.on_tree_item_changed)
         self.tree.setUniformRowHeights(True)
@@ -435,16 +506,15 @@ class MainWindow(QMainWindow):
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("Search files")
         self.search_edit.textChanged.connect(self.refresh_flat_table)
-        self.flat_table = QTableWidget(0, 6)
-        self.flat_table.setHorizontalHeaderLabels(["File", "Type", "Mode", "Size", "Included", "Context"])
+        self.flat_table = QTableWidget(0, 3)
+        self.flat_table.setHorizontalHeaderLabels(["", "File", "Size"])
         self.flat_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.flat_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.flat_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.flat_table.horizontalHeader().setStretchLastSection(True)
-        self.flat_table.setColumnWidth(0, 560)
-        self.flat_table.setColumnWidth(1, 160)
+        self.flat_table.setColumnWidth(0, 42)
+        self.flat_table.setColumnWidth(1, 560)
         self.flat_table.setColumnWidth(2, 110)
-        self.flat_table.setColumnWidth(4, 90)
         self.flat_table.itemSelectionChanged.connect(self.on_table_selection_changed)
         self.flat_table.itemChanged.connect(self.on_table_item_changed)
         self.flat_table.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -531,26 +601,54 @@ class MainWindow(QMainWindow):
         self.user_prompt_edit.textChanged.connect(self._on_prompt_fields_changed)
         self.disk_note = QLabel("Files are read from disk, so save files before importing or dragging them in.")
         self.disk_note.setObjectName("hintLabel")
+        self.copy_banner = QLabel("")
+        self.copy_banner.setObjectName("copyBanner")
+        self.copy_banner.setVisible(False)
+        self.copy_button = QPushButton("Copy Prompt")
+        self.copy_button.setObjectName("primaryAction")
+        self.copy_button.setMinimumHeight(46)
+        self.copy_button.setMinimumWidth(190)
+        copy_prompt_row = QHBoxLayout()
+        copy_prompt_row.addWidget(self.copy_button)
+        copy_prompt_row.addStretch(1)
         prompt_layout.addWidget(prompt_heading)
         prompt_layout.addWidget(self.user_prompt_edit)
+        prompt_layout.addWidget(self.copy_banner, alignment=Qt.AlignLeft)
+        prompt_layout.addLayout(copy_prompt_row)
         prompt_layout.addWidget(self.disk_note)
         root_layout.addWidget(prompt_card)
 
-        footer = QHBoxLayout()
+        footer_card = QFrame()
+        footer_card.setObjectName("card")
+        footer = QHBoxLayout(footer_card)
+        footer.setContentsMargins(18, 14, 18, 14)
+        footer.setSpacing(14)
         self.status_label = QLabel("Ready.")
-        self.token_count_label = QLabel("Estimated JSON tokens: 0")
-        self.token_count_label.setObjectName("hintLabel")
+        self.status_label.setMinimumWidth(220)
+        token_layout = QVBoxLayout()
+        token_layout.setSpacing(6)
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(False)
+        self.token_count_label = QLabel("Total prompt tokens: 0")
+        self.token_count_label.setObjectName("tokenTotal")
+        self.token_count_label.setAlignment(Qt.AlignCenter)
+        self.token_bar = TokenBarWidget()
+        self.token_breakdown_label = QLabel("")
+        self.token_breakdown_label.setObjectName("tokenBreakdown")
+        self.token_breakdown_label.setWordWrap(True)
+        self.token_breakdown_label.setTextFormat(Qt.TextFormat.RichText)
+        token_layout.addWidget(self.progress_bar)
+        token_layout.addWidget(self.token_count_label)
+        token_layout.addWidget(self.token_bar)
+        token_layout.addWidget(self.token_breakdown_label)
         self.cancel_button = QPushButton("Cancel")
         self.cancel_button.clicked.connect(self.cancel_build)
-        footer.addWidget(self.status_label, 3)
-        footer.addWidget(self.token_count_label, 2)
-        footer.addWidget(self.progress_bar, 2)
+        footer.addWidget(self.status_label, 1)
+        footer.addLayout(token_layout, 4)
         footer.addWidget(self.cancel_button)
-        root_layout.addLayout(footer)
+        root_layout.addWidget(footer_card)
 
         self.add_file_action.triggered.connect(lambda: self.add_files())
         self.add_folder_action.triggered.connect(lambda: self.add_folder())
@@ -575,6 +673,7 @@ class MainWindow(QMainWindow):
     def _sync_settings_controls(self) -> None:
         self._set_system_template_preview()
         self._update_input_summary()
+        self._update_loaded_stats()
         self._update_token_count()
 
     def _update_input_summary(self) -> None:
@@ -673,6 +772,7 @@ class MainWindow(QMainWindow):
         self.preview.clear()
         self.detail_label.setText("Add a file or folder to begin.")
         self.bundle_summary.clear()
+        self._update_loaded_stats()
         self._update_input_summary()
         self._update_token_count(0, 0)
         self.status_label.setText("Ready.")
@@ -687,6 +787,7 @@ class MainWindow(QMainWindow):
             self.preview.clear()
             self.detail_label.setText("Add a file or folder to begin.")
             self.bundle_summary.clear()
+            self._update_loaded_stats()
             self._update_token_count()
             self.status_label.setText("No input paths.")
             self.statusBar().showMessage("No input paths")
@@ -786,6 +887,10 @@ class MainWindow(QMainWindow):
                 self.remove_selected()
                 event.accept()
                 return True
+            if key_event is not None and key_event.key() in {Qt.Key_Return, Qt.Key_Enter}:
+                self.include_full_selected()
+                event.accept()
+                return True
         return super().eventFilter(watched, event)
 
     def on_build_progress(self, message: str, current: int, total: int) -> None:
@@ -819,25 +924,21 @@ class MainWindow(QMainWindow):
         self.status_label.setText("Cancelled.")
         self.statusBar().showMessage("Scan cancelled")
 
+
     def _show_bundle_summary(self, result: BuildResult) -> None:
         bundle = result.bundle
-        file_count = len(bundle["files"])
-        graph_groups = len(bundle["dependency_graph"])
-        linked_files = sum(len(item["includes"]) for item in bundle["dependency_graph"])
         json_bytes = len(result.json_text.encode("utf-8"))
         json_chars = len(result.json_text)
         estimated_tokens = self._estimate_tokens(result.json_text)
+        self._update_loaded_stats()
         self._update_token_count(estimated_tokens, json_bytes)
         self.bundle_summary.setText(
             f"""
             <h2 style="margin: 0 0 12px 0;">Bundle overview</h2>
             <table cellspacing="0" cellpadding="6">
-              <tr><td><b>Files</b></td><td>{file_count:,}</td></tr>
-              <tr><td><b>Dependency groups</b></td><td>{graph_groups:,}</td></tr>
-              <tr><td><b>Linked files</b></td><td>{linked_files:,}</td></tr>
               <tr><td><b>JSON characters</b></td><td>{json_chars:,}</td></tr>
               <tr><td><b>JSON bytes</b></td><td>{json_bytes:,}</td></tr>
-              <tr><td><b>Estimated JSON tokens</b></td><td>{estimated_tokens:,}</td></tr>
+              <tr><td><b>Estimated prompt tokens</b></td><td>{estimated_tokens:,}</td></tr>
               <tr><td><b>System prompt characters</b></td><td>{len(bundle["system_prompt"]):,}</td></tr>
               <tr><td><b>LLM task characters</b></td><td>{len(bundle["llm_task"]):,}</td></tr>
               <tr><td><b>User prompt characters</b></td><td>{len(bundle["user_prompt"]):,}</td></tr>
@@ -845,10 +946,72 @@ class MainWindow(QMainWindow):
             """
         )
 
+
     def _estimate_tokens(self, text: str) -> int:
         if not text:
             return 0
         return max(1, (len(text) + 3) // 4)
+
+    def _token_palette(self) -> dict[str, str]:
+        return {
+            "System prompt": "#38bdf8",
+            "User prompt": "#22c55e",
+            "LLM task prompt": "#a78bfa",
+            "File context": "#f97316",
+            "Other": "#64748b",
+        }
+
+    def _token_breakdown(self, bundle: dict, total_tokens: int) -> dict[str, int]:
+        system_tokens = self._estimate_tokens(str(bundle.get("system_prompt", "")))
+        llm_task_tokens = self._estimate_tokens(str(bundle.get("llm_task", "")))
+        user_prompt_tokens = self._estimate_tokens(str(bundle.get("user_prompt", "")))
+        file_context_tokens = 0
+        for file_record in bundle.get("files", []):
+            if not isinstance(file_record, dict):
+                continue
+            content = file_record.get("content")
+            if content:
+                file_context_tokens += self._estimate_tokens(str(content))
+        known_tokens = system_tokens + llm_task_tokens + user_prompt_tokens + file_context_tokens
+        breakdown = {
+            "System prompt": system_tokens,
+            "User prompt": user_prompt_tokens,
+            "LLM task prompt": llm_task_tokens,
+            "File context": file_context_tokens,
+            "Other": max(0, total_tokens - known_tokens),
+        }
+        return dict(sorted(breakdown.items(), key=lambda item: item[1], reverse=True))
+
+    def _token_breakdown_html(self, breakdown: dict[str, int], total_tokens: int) -> str:
+        if total_tokens <= 0:
+            return "No prompt bundle has been built yet."
+
+        palette = self._token_palette()
+        detail_parts = []
+        for label, tokens in breakdown.items():
+            percent = (tokens / total_tokens) * 100 if total_tokens else 0
+            detail_parts.append(
+                f'<span style="white-space:nowrap;">'
+                f'<span style="color:{palette[label]};">&#9632;</span> '
+                f'<b>{label}</b>: {tokens:,} ({percent:.1f}%)</span>'
+            )
+        return " &nbsp; ".join(detail_parts)
+
+    def _update_loaded_stats(self) -> None:
+        if self.workspace is None or self.current_result is None:
+            self.loaded_stats_label.setText("No project loaded yet.")
+            return
+
+        bundle = self.current_result.bundle
+        file_count = len(bundle["files"])
+        graph_groups = len(bundle["dependency_graph"])
+        linked_files = sum(len(item["includes"]) for item in bundle["dependency_graph"])
+        self.loaded_stats_label.setText(
+            f"<b>Files:</b> {file_count:,} &nbsp; "
+            f"<b>Dependency groups:</b> {graph_groups:,} &nbsp; "
+            f"<b>Linked dependencies:</b> {linked_files:,}<br>"
+            f"<b>Project root:</b> {self.workspace.project_root.as_posix()}"
+        )
 
     def _update_token_count(self, estimated_tokens: int | None = None, json_bytes: int | None = None) -> None:
         if estimated_tokens is None:
@@ -860,7 +1023,15 @@ class MainWindow(QMainWindow):
                 json_bytes = len(self.current_result.json_text.encode("utf-8"))
         elif json_bytes is None:
             json_bytes = len(self.current_result.json_text.encode("utf-8")) if self.current_result else 0
-        self.token_count_label.setText(f"Estimated JSON tokens: {estimated_tokens:,}")
+
+        self.token_count_label.setText(f"Total prompt tokens: {estimated_tokens:,}")
+        if self.current_result is None:
+            self.token_bar.set_breakdown({}, 0, self._token_palette())
+            self.token_breakdown_label.setText("No prompt bundle has been built yet.")
+        else:
+            breakdown = self._token_breakdown(self.current_result.bundle, estimated_tokens)
+            self.token_bar.set_breakdown(breakdown, estimated_tokens, self._token_palette())
+            self.token_breakdown_label.setText(self._token_breakdown_html(breakdown, estimated_tokens))
         self.token_count_label.setToolTip(
             f"Approximate token count from serialized JSON size ({json_bytes:,} bytes)."
         )
@@ -885,6 +1056,7 @@ class MainWindow(QMainWindow):
                 bundle=bundle,
                 json_text=serialize_bundle(bundle),
             )
+            self._update_loaded_stats()
             self._update_token_count()
         except BuildError:
             return
@@ -914,25 +1086,57 @@ class MainWindow(QMainWindow):
             return True
         return any(self._should_show_tree_node(child) for child in node.children) if node.children else True
 
+
+    def _display_name_for_record(self, record) -> str:
+        if self.workspace is None:
+            return record.filename
+        matches = [
+            item
+            for item in self.workspace.files.values()
+            if item.filename == record.filename
+        ]
+        return record.repo_relative_path if len(matches) > 1 else record.filename
+
+    def _display_label_for_node(self, node: TreeNode, record) -> str:
+        label = self._display_name_for_record(record)
+        if node.reused:
+            label = f"{label} (reused)"
+        if record.is_large and not record.included:
+            label = f"{label} (large)"
+        if record.is_binary:
+            label = f"{label} (binary)"
+        return label
+
     def _build_tree_item(self, node: TreeNode) -> QTreeWidgetItem | None:
         if not self._should_show_tree_node(node):
             return None
-        item = QTreeWidgetItem([node.label, node.kind, ""])
+
         record = None
+        label = node.label
+        if node.file_id and self.workspace and node.file_id in self.workspace.files:
+            record = self.workspace.files[node.file_id]
+            label = self._display_label_for_node(node, record)
+
+        item = QTreeWidgetItem([label, ""])
         if node.file_id:
             item.setData(0, Qt.UserRole, node.file_id)
-            if self.workspace and node.file_id in self.workspace.files:
-                record = self.workspace.files[node.file_id]
+            if record is not None:
                 item.setCheckState(0, Qt.Checked if record.included else Qt.Unchecked)
-                item.setText(1, record.context_type)
-                item.setText(2, self._format_size(record.size_bytes))
+                item.setText(1, self._format_size(record.size_bytes))
                 self._style_item(item, record)
         else:
             item.setData(0, Qt.UserRole, None)
+
+        seen_child_file_ids: set[str] = set()
         for child in node.children:
+            if child.file_id:
+                if child.file_id in seen_child_file_ids:
+                    continue
+                seen_child_file_ids.add(child.file_id)
             child_item = self._build_tree_item(child)
             if child_item is not None:
                 item.addChild(child_item)
+
         if node.kind == "folder":
             item.setIcon(0, self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon))
         elif node.kind == "skipped":
@@ -1055,11 +1259,12 @@ class MainWindow(QMainWindow):
 
         return self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon)
 
+
     def _style_item(self, item: QTreeWidgetItem, record) -> None:
         if record.is_dependency:
             from PySide6.QtGui import QBrush, QColor
 
-            for col in range(3):
+            for col in range(item.columnCount()):
                 item.setForeground(col, QBrush(QColor("gray")))
         if record.source_kind == "direct_file":
             font = item.font(0)
@@ -1089,20 +1294,18 @@ class MainWindow(QMainWindow):
         finally:
             self._refreshing_table = False
 
+
     def _set_table_row(self, row: int, record) -> None:
         items = [
-            QTableWidgetItem(record.repo_relative_path),
-            QTableWidgetItem(record.context_type),
-            QTableWidgetItem(record.inclusion_mode),
-            QTableWidgetItem(self._format_size(record.size_bytes)),
             QTableWidgetItem(),
-            QTableWidgetItem(record.source_kind),
+            QTableWidgetItem(self._display_name_for_record(record)),
+            QTableWidgetItem(self._format_size(record.size_bytes)),
         ]
-        items[0].setIcon(self._icon_for_record(record))
-        items[4].setCheckState(Qt.Checked if record.included else Qt.Unchecked)
+        items[1].setIcon(self._icon_for_record(record))
+        items[0].setCheckState(Qt.Checked if record.included else Qt.Unchecked)
         for col, item in enumerate(items):
             item.setData(Qt.UserRole, record.id)
-            if col == 4:
+            if col == 0:
                 item.setFlags((item.flags() | Qt.ItemIsUserCheckable) & ~Qt.ItemIsEditable)
             else:
                 item.setFlags(item.flags() & ~Qt.ItemIsEditable)
@@ -1128,18 +1331,15 @@ class MainWindow(QMainWindow):
             self.selected_file_id = file_id
             self.show_record(file_id)
 
+
     def on_tree_item_changed(self, item: QTreeWidgetItem, column: int) -> None:
         if self._refreshing_tree or column != 0:
             return
         file_id = item.data(0, Qt.UserRole)
         if not isinstance(file_id, str) or self.workspace is None or file_id not in self.workspace.files:
             return
-        record = self.workspace.files[file_id]
         new_mode = "full" if item.checkState(0) == Qt.Checked else "excluded"
-        self.file_overrides[file_id] = new_mode
-        record.inclusion_mode = new_mode
-        record.included = new_mode != "excluded"
-        self._refresh_all_views()
+        self._set_file_mode(file_id, new_mode)
 
     def on_table_selection_changed(self) -> None:
         if self._refreshing_table:
@@ -1152,8 +1352,9 @@ class MainWindow(QMainWindow):
             self.selected_file_id = file_id
             self.show_record(file_id)
 
+
     def on_table_item_changed(self, item: QTableWidgetItem) -> None:
-        if self._refreshing_table or item.column() != 4:
+        if self._refreshing_table or item.column() != 0:
             return
         file_id = item.data(Qt.UserRole)
         if not isinstance(file_id, str):
@@ -1180,7 +1381,7 @@ class MainWindow(QMainWindow):
         if row < 0:
             return
         self.flat_table.selectRow(row)
-        item = self.flat_table.item(row, 0)
+        item = self.flat_table.item(row, 1) or self.flat_table.item(row, 0)
         file_id = item.data(Qt.UserRole) if item is not None else None
         if not isinstance(file_id, str):
             return
@@ -1242,13 +1443,72 @@ class MainWindow(QMainWindow):
                     ids.append(file_id)
         return ids
 
-    def _set_file_mode(self, file_id: str, mode: str) -> None:
+
+    def _dependency_child_map(self) -> dict[str, set[str]]:
+        child_map: dict[str, set[str]] = {}
+        if self.workspace is None:
+            return child_map
+        for edge in self.workspace.dependency_graph:
+            if edge.target_id is None:
+                continue
+            child_map.setdefault(edge.source_id, set()).add(edge.target_id)
+        return child_map
+
+    def _dependency_parent_map(self) -> dict[str, set[str]]:
+        parent_map: dict[str, set[str]] = {}
+        if self.workspace is None:
+            return parent_map
+        for edge in self.workspace.dependency_graph:
+            if edge.target_id is None:
+                continue
+            parent_map.setdefault(edge.target_id, set()).add(edge.source_id)
+        return parent_map
+
+    def _apply_file_mode_without_refresh(self, file_id: str, mode: str) -> None:
         if self.workspace is None or file_id not in self.workspace.files:
             return
         self.file_overrides[file_id] = mode
         record = self.workspace.files[file_id]
         record.inclusion_mode = mode
         record.included = mode != "excluded"
+
+    def _cascade_excluded_dependencies(self, file_id: str) -> None:
+        if self.workspace is None:
+            return
+
+        child_map = self._dependency_child_map()
+        parent_map = self._dependency_parent_map()
+        excluded_now: set[str] = {file_id}
+        stack = list(child_map.get(file_id, set()))
+
+        while stack:
+            target_id = stack.pop()
+            if target_id in excluded_now or target_id not in self.workspace.files:
+                continue
+
+            parents = parent_map.get(target_id, set())
+            has_included_parent = False
+            for parent_id in parents:
+                if parent_id in excluded_now:
+                    continue
+                parent_record = self.workspace.files.get(parent_id)
+                if parent_record is not None and parent_record.included:
+                    has_included_parent = True
+                    break
+
+            if has_included_parent:
+                continue
+
+            self._apply_file_mode_without_refresh(target_id, "excluded")
+            excluded_now.add(target_id)
+            stack.extend(child_map.get(target_id, set()))
+
+    def _set_file_mode(self, file_id: str, mode: str) -> None:
+        if self.workspace is None or file_id not in self.workspace.files:
+            return
+        self._apply_file_mode_without_refresh(file_id, mode)
+        if mode == "excluded":
+            self._cascade_excluded_dependencies(file_id)
         self._refresh_all_views()
 
     def add_files(self) -> None:
@@ -1328,14 +1588,19 @@ class MainWindow(QMainWindow):
         for file_id in self._selected_file_ids():
             self._set_file_mode(file_id, "excluded")
 
+
     def copy_json(self) -> None:
         bundle = self._build_current_bundle()
         if bundle is None:
             return
         text = serialize_bundle(bundle)
+        token_count = self._estimate_tokens(text)
         QApplication.clipboard().setText(text)
-        self._log("Copied JSON bundle to clipboard (%d bytes)", len(text.encode("utf-8")))
-        self.status_label.setText("JSON copied to clipboard.")
+        self._log("Copied prompt bundle to clipboard (%d bytes)", len(text.encode("utf-8")))
+        self.copy_banner.setText(f"Prompt copied to clipboard ({token_count:,} tokens)")
+        self.copy_banner.setVisible(True)
+        QTimer.singleShot(5000, lambda: self.copy_banner.setVisible(False))
+        self.status_label.setText("Prompt copied to clipboard.")
         self.statusBar().showMessage("Prompt bundle copied to clipboard")
 
     def export_json(self) -> None:
@@ -1416,12 +1681,179 @@ class MainWindow(QMainWindow):
         if event.mimeData().hasUrls() or event.mimeData().hasText():
             event.acceptProposedAction()
 
+
     def dropEvent(self, event) -> None:  # type: ignore[override]
         paths = self._paths_from_mime_data(event.mimeData())
-        if paths:
-            self._log("Dropped %d path(s) into the app", len(paths))
-            self._extend_input_paths(paths)
-            event.acceptProposedAction()
+        if not paths:
+            return
+
+        patch_paths = [path for path in paths if self._is_patch_path(path)]
+        input_paths = [path for path in paths if not self._is_patch_path(path)]
+
+        if patch_paths:
+            self._log("Dropped %d patch file(s) into the app", len(patch_paths))
+            for patch_path in patch_paths:
+                self._handle_patch_drop(Path(patch_path).expanduser().resolve())
+
+        if input_paths:
+            self._log("Dropped %d path(s) into the app", len(input_paths))
+            self._extend_input_paths(input_paths)
+
+        event.acceptProposedAction()
+
+    def _is_patch_path(self, path: str) -> bool:
+        return Path(path).suffix.lower() in {".diff", ".patch"}
+
+    def _run_git_apply(self, args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", "apply", *args],
+            cwd=str(cwd),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+    def _format_process_error(self, result: subprocess.CompletedProcess[str]) -> str:
+        message = (result.stderr or result.stdout or "").strip()
+        return message or f"Command exited with code {result.returncode}."
+
+    def _handle_patch_drop(self, patch_path: Path) -> None:
+        if self.workspace is None:
+            QMessageBox.information(
+                self,
+                "No workspace loaded",
+                "Load or scan a workspace before dropping a .diff or .patch file.",
+            )
+            return
+
+        if not patch_path.exists() or not patch_path.is_file():
+            QMessageBox.warning(self, "Patch not found", f"Could not read patch file:\n{patch_path}")
+            return
+
+        project_root = Path(self.workspace.project_root)
+        current_check = self._run_git_apply(["--check", str(patch_path)], project_root)
+        if current_check.returncode == 0:
+            answer = QMessageBox.question(
+                self,
+                "Patch applies cleanly",
+                "This patch can be applied to the current workspace. Apply it now?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                self._apply_patch_to_workspace(patch_path)
+            else:
+                self.status_label.setText("Patch check passed.")
+                self.statusBar().showMessage("Patch check passed")
+            return
+
+        snapshot_ok, snapshot_error = self._check_patch_against_loaded_snapshot(patch_path)
+        if snapshot_ok:
+            answer = QMessageBox.question(
+                self,
+                "Patch matches loaded file state",
+                (
+                    "This patch does not apply to the current workspace, but it does apply "
+                    "after restoring the files currently loaded in Prompt Builder.\n\n"
+                    "That usually means the workspace files changed after the prompt was created.\n\n"
+                    "Overwrite the loaded workspace files with their older loaded state and then apply the patch?"
+                ),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                self._restore_loaded_files_to_workspace()
+                self._apply_patch_to_workspace(patch_path)
+            else:
+                self.status_label.setText("Patch applies only to loaded file state.")
+                self.statusBar().showMessage("Patch applies only to loaded file state")
+            return
+
+        QMessageBox.warning(
+            self,
+            "Patch cannot be applied",
+            (
+                "The patch does not apply to the current workspace, and it also did not "
+                "apply in an isolated workspace with the loaded file state.\n\n"
+                "Current workspace error:\n"
+                f"{self._format_process_error(current_check)}\n\n"
+                "Loaded-state smoke check error:\n"
+                f"{snapshot_error}"
+            ),
+        )
+        self.status_label.setText("Patch check failed.")
+        self.statusBar().showMessage("Patch check failed")
+
+    def _copy_workspace_for_patch_check(self, destination: Path) -> None:
+        if self.workspace is None:
+            return
+        ignore = shutil.ignore_patterns(
+            ".git",
+            ".hg",
+            ".svn",
+            ".venv",
+            "venv",
+            "env",
+            "__pycache__",
+            ".mypy_cache",
+            ".pytest_cache",
+            ".ruff_cache",
+            ".tox",
+            ".nox",
+            "build",
+            "dist",
+            "node_modules",
+        )
+        shutil.copytree(self.workspace.project_root, destination, ignore=ignore)
+
+    def _overwrite_loaded_files(self, root: Path) -> None:
+        if self.workspace is None:
+            return
+        for record in self.workspace.files.values():
+            if record.content is None:
+                continue
+            relative_path = Path(record.repo_relative_path)
+            if relative_path.is_absolute():
+                continue
+            target_path = root / relative_path
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_path.write_text(record.content, encoding="utf-8")
+
+    def _check_patch_against_loaded_snapshot(self, patch_path: Path) -> tuple[bool, str]:
+        if self.workspace is None:
+            return False, "No workspace is loaded."
+        try:
+            with tempfile.TemporaryDirectory(prefix="prompt-builder-patch-") as temp_dir:
+                temp_root = Path(temp_dir) / "workspace"
+                self._copy_workspace_for_patch_check(temp_root)
+                self._overwrite_loaded_files(temp_root)
+                result = self._run_git_apply(["--check", str(patch_path)], temp_root)
+                if result.returncode == 0:
+                    return True, ""
+                return False, self._format_process_error(result)
+        except Exception as exc:
+            return False, str(exc)
+
+    def _restore_loaded_files_to_workspace(self) -> None:
+        if self.workspace is None:
+            return
+        self._overwrite_loaded_files(Path(self.workspace.project_root))
+
+    def _apply_patch_to_workspace(self, patch_path: Path) -> None:
+        if self.workspace is None:
+            return
+        result = self._run_git_apply([str(patch_path)], Path(self.workspace.project_root))
+        if result.returncode != 0:
+            QMessageBox.warning(
+                self,
+                "Patch apply failed",
+                self._format_process_error(result),
+            )
+            self.status_label.setText("Patch apply failed.")
+            self.statusBar().showMessage("Patch apply failed")
+            return
+        self.status_label.setText("Patch applied.")
+        self.statusBar().showMessage("Patch applied")
+        self.request_rebuild()
 
     def _paths_from_mime_data(self, mime_data) -> list[str]:
         paths: list[str] = []
