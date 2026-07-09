@@ -5,8 +5,12 @@ description = "PySide prompt builder for Python context bundles"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "firebase-admin>=7.5.0",
+    "notion-client>=3.1.0",
     "pyside6>=6.11.1",
     "pytest>=9.1.1",
+    "pyyaml>=6.0.3",
+    "requests>=2.34.2",
 ]
 
 [project.scripts]

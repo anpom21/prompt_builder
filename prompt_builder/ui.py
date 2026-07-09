@@ -5,6 +5,7 @@ import json
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -156,9 +157,15 @@ class TokenBarWidget(QWidget):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, default_paths: list[str] | None = None, verbose: bool = False) -> None:
+    def __init__(
+        self,
+        default_paths: list[str] | None = None,
+        verbose: bool = False,
+        session_path: str | None = None,
+    ) -> None:
         super().__init__()
         self.setWindowTitle("Prompt Builder")
+        self._set_application_icon()
         self.resize(1500, 950)
         self.setAcceptDrops(True)
         self.verbose = verbose
@@ -176,6 +183,7 @@ class MainWindow(QMainWindow):
         self._file_icon_cache: dict[str, QIcon] = {}
         self._material_icon_dir = Path(__file__).resolve().parent / "icons" / "material-icon-theme" / "icons"
         self._session_dir = self._default_session_dir()
+        self._initial_session_path = Path(session_path).expanduser() if session_path else None
         self._current_session_path: Path | None = self._session_dir / "autosave.json"
         self._last_saved_session_payload = ""
         self._session_dirty = False
@@ -198,11 +206,27 @@ class MainWindow(QMainWindow):
         self._refresh_session_list()
         self._update_session_indicator(saved=True, message="Autosave ready")
         loaded_initial_session = False
-        if not self.input_paths:
+        if self._initial_session_path is not None:
+            loaded_initial_session = self._load_session_from_path(self._initial_session_path, announce=False)
+        elif not self.input_paths:
             loaded_initial_session = self._load_initial_session()
         if self.input_paths and not loaded_initial_session:
             self._log("Loaded %d startup path(s)", len(self.input_paths))
             self.request_rebuild()
+
+    def _set_application_icon(self) -> None:
+        logo_path = Path(__file__).resolve().parent / "logo.png"
+        if not logo_path.exists():
+            return
+
+        icon = QIcon(str(logo_path))
+        if icon.isNull():
+            return
+
+        self.setWindowIcon(icon)
+        app = QApplication.instance()
+        if app is not None:
+            app.setWindowIcon(icon)
 
     def _build_menu_bar(self) -> None:
         file_menu = self.menuBar().addMenu("&File")
@@ -453,26 +477,60 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "session_list"):
             return
         self._session_dir.mkdir(parents=True, exist_ok=True)
-        current_path = self._current_session_path.expanduser().resolve() if self._current_session_path else None
+        current_path = self._resolve_session_path(self._current_session_path)
         self.session_list.clear()
-        session_paths = sorted(
-            (path for path in self._session_dir.glob("*.json") if not self._is_hidden_session_path(path)),
+
+        session_paths: list[Path] = []
+        seen_paths: set[str] = set()
+
+        def add_session_path(path: Path) -> None:
+            resolved = self._resolve_session_path(path)
+            key = resolved.as_posix() if resolved is not None else path.expanduser().as_posix()
+            if key in seen_paths:
+                return
+            seen_paths.add(key)
+            session_paths.append(path)
+
+        if self._current_session_path is not None:
+            add_session_path(self._current_session_path.expanduser())
+
+        visible_saved_paths = sorted(
+            (
+                path
+                for path in self._session_dir.glob("*.json")
+                if not self._is_hidden_session_path(path)
+                or self._same_session_path(path, current_path)
+            ),
             key=lambda path: path.stat().st_mtime if path.exists() else 0,
             reverse=True,
         )
+        for path in visible_saved_paths:
+            add_session_path(path)
+
         for path in session_paths:
             display = path.stem
-            try:
-                resolved = path.expanduser().resolve()
-            except OSError:
-                resolved = path
-            if current_path is not None and resolved == current_path:
-                display = f"{display}  • current"
+            is_current = self._same_session_path(path, current_path)
             item = QListWidgetItem(display)
             item.setData(Qt.UserRole, path.as_posix())
             item.setToolTip(path.as_posix())
+            if is_current:
+                font = item.font()
+                font.setBold(True)
+                item.setFont(font)
             self.session_list.addItem(item)
         self._update_session_indicator()
+
+    def _resolve_session_path(self, path: Path | None) -> Path | None:
+        if path is None:
+            return None
+        try:
+            return path.expanduser().resolve()
+        except OSError:
+            return path.expanduser()
+
+    def _same_session_path(self, path: Path, current_path: Path | None) -> bool:
+        resolved = self._resolve_session_path(path)
+        return current_path is not None and resolved == current_path
 
     def _load_initial_session(self) -> bool:
         if self._current_session_path is None or not self._current_session_path.exists():
@@ -1022,8 +1080,8 @@ class MainWindow(QMainWindow):
         self.copy_button.setMinimumHeight(46)
         self.copy_button.setMinimumWidth(190)
         copy_prompt_row = QHBoxLayout()
-        copy_prompt_row.addWidget(self.copy_banner, alignment=Qt.AlignLeft)
         copy_prompt_row.addWidget(self.copy_button)
+        copy_prompt_row.addWidget(self.copy_banner, alignment=Qt.AlignLeft)
         copy_prompt_row.addStretch(1)
         prompt_layout.addWidget(prompt_heading)
         prompt_layout.addWidget(self.user_prompt_edit)
@@ -2069,7 +2127,7 @@ class MainWindow(QMainWindow):
         token_count = self._estimate_tokens(text)
         QApplication.clipboard().setText(text)
         self._log("Copied prompt bundle to clipboard (%d bytes)", len(text.encode("utf-8")))
-        self.copy_banner.setText(f"Copied prompt to clipboard ({token_count:,} tokens)")
+        self.copy_banner.setText(f"Copied to clipboard ({token_count:,} tokens)")
         self.copy_banner.setVisible(True)
         QTimer.singleShot(5000, lambda: self.copy_banner.setVisible(False))
         self.status_label.setText("Prompt copied to clipboard.")
@@ -2398,6 +2456,54 @@ class MainWindow(QMainWindow):
             return
         self._overwrite_loaded_files(Path(self.workspace.project_root))
 
+    def _ask_restart_after_patch_apply(self) -> bool:
+        answer = QMessageBox.question(
+            self,
+            "Restart Prompt Builder?",
+            (
+                "Patch applied successfully. Restart Prompt Builder now to apply the changes?\n\n"
+                "The current session will be saved and reopened after restart."
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+        self._restart_application_with_current_session()
+        return True
+
+    def _restart_application_with_current_session(self) -> None:
+        session_path = self._current_session_path or (self._session_dir / "autosave.json")
+        if not self._write_session_file(session_path, status_message="Saved before restart"):
+            return
+
+        restart_args = self._restart_args_for_session(session_path)
+        try:
+            subprocess.Popen(restart_args, cwd=str(Path.cwd()))
+        except OSError as exc:
+            QMessageBox.warning(self, "Restart failed", str(exc))
+            self.status_label.setText("Restart failed.")
+            self.statusBar().showMessage("Restart failed")
+            return
+
+        QApplication.quit()
+
+    def _restart_args_for_session(self, session_path: Path) -> list[str]:
+        args = [sys.executable, *sys.argv]
+        cleaned_args: list[str] = []
+        skip_next = False
+        for arg in args:
+            if skip_next:
+                skip_next = False
+                continue
+            if arg == "--session":
+                skip_next = True
+                continue
+            if arg.startswith("--session="):
+                continue
+            cleaned_args.append(arg)
+        cleaned_args.append(f"--session={session_path.expanduser().as_posix()}")
+        return cleaned_args
+
     def _apply_patch_to_workspace(self, patch_path: Path) -> None:
         if self.workspace is None:
             return
@@ -2413,6 +2519,8 @@ class MainWindow(QMainWindow):
             return
         self.status_label.setText("Patch applied.")
         self.statusBar().showMessage("Patch applied")
+        if self._ask_restart_after_patch_apply():
+            return
         self.request_rebuild()
 
     def _paths_from_mime_data(self, mime_data) -> list[str]:
@@ -2436,8 +2544,15 @@ class MainWindow(QMainWindow):
         return paths
 
 
-def launch_app(default_paths: list[str] | None = None, verbose: bool = False) -> int:
-    app = QApplication.instance() or QApplication([])
-    window = MainWindow(default_paths=default_paths, verbose=verbose)
+def launch_app(
+    default_paths: list[str] | None = None,
+    verbose: bool = False,
+    session_path: str | None = None,
+) -> int:
+    app = QApplication.instance() or QApplication(["prompt-builder"])
+    app.setApplicationName("prompt-builder")
+    app.setApplicationDisplayName("Prompt Builder")
+    app.setDesktopFileName("prompt-builder")
+    window = MainWindow(default_paths=default_paths, verbose=verbose, session_path=session_path)
     window.show()
     return app.exec()
