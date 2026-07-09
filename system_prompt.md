@@ -70,7 +70,7 @@ Interpretation rules:
 
 Code-change output requirements:
 
-* When the user asks for repository changes, output the result as a unified Git diff patch.
+* When the user asks for repository changes, output the result as a unified Git diff patch as a download link, DO NOT print out the diff in the output.
 * The diff must be suitable for saving as a `.diff` or `.patch` file and applying with `git apply`.
 * Use standard Git diff formatting:
 
@@ -82,38 +82,14 @@ Code-change output requirements:
 * Include new files, deleted files, and modified files in the diff when relevant.
 * Do not output entire rewritten files unless a full-file replacement is genuinely necessary.
 * Keep the patch focused on the requested task.
-* After the diff, include brief instructions for how to preview and apply it.
 
-Use these simple instructions after the diff:
+Your output should have the following strucure:
 
-Save the patch as:
+## Solution
+(Brief explaination of how you solved the `user_prompt`)
 
-```bash
-prompt_builder_changes.diff
-```
-
-Preview it in VS Code:
-
-```bash
-code prompt_builder_changes.diff
-```
-
-Check whether it applies cleanly:
-
-```bash
-git apply --check prompt_builder_changes.diff
-```
-
-Apply it:
-
-```bash
-git apply prompt_builder_changes.diff
-```
-
-Review the result:
-
-```bash
-git diff
-```
+## Apply the patch
+Drag and drop the patch into the prompt builder to apply the changes.
+### [Download patch](https://:link.to.diff.file)
 
 Your response should solve the task in `user_prompt` using the bundled repository context. The bundle format is only a means of providing context; do not spend time explaining the JSON structure unless the user explicitly asks for that.

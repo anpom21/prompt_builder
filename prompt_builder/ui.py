@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import json
+import re
 import shutil
 import subprocess
 import tempfile
@@ -21,6 +22,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -61,6 +63,8 @@ from .core import (
 )
 
 logger = logging.getLogger(__name__)
+
+SESSION_DIR_NAME = ".prompt_sessions"
 
 
 @dataclass(slots=True)
@@ -247,7 +251,39 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _default_session_dir() -> Path:
-        return Path.home() / ".prompt_builder" / "sessions"
+        return Path.cwd() / SESSION_DIR_NAME
+
+    @staticmethod
+    def _session_dir_for_project_root(project_root: Path) -> Path:
+        return Path(project_root) / SESSION_DIR_NAME
+
+    def _set_session_dir(self, session_dir: Path) -> None:
+        old_dir = self._session_dir.expanduser()
+        new_dir = session_dir.expanduser()
+        try:
+            if old_dir.resolve() == new_dir.resolve():
+                return
+        except OSError:
+            if old_dir == new_dir:
+                return
+
+        current_path = self._current_session_path
+        self._session_dir = new_dir
+
+        if current_path is None:
+            self._current_session_path = self._session_dir / "autosave.json"
+        else:
+            try:
+                current_parent = current_path.expanduser().resolve().parent
+                old_parent = old_dir.resolve()
+                under_old_session_dir = current_parent == old_parent
+            except OSError:
+                under_old_session_dir = current_path.expanduser().parent == old_dir
+
+            if under_old_session_dir:
+                self._current_session_path = self._session_dir / current_path.name
+
+        self._refresh_session_list()
 
     def _safe_session_name(self, name: str) -> str:
         safe = "".join(char if char.isalnum() or char in {"-", "_"} else "-" for char in name.strip().lower())
@@ -275,7 +311,7 @@ class MainWindow(QMainWindow):
 
         heading = QLabel("Prompt Sessions")
         heading.setObjectName("sectionLabel")
-        hint = QLabel("Autosave writes the current session after one second of no edits. Double-click a session to switch.")
+        hint = QLabel("Sessions are stored in the current repository under .prompt_sessions/. Double-click a session to switch.")
         hint.setObjectName("hintLabel")
         hint.setWordWrap(True)
         self.session_path_label = QLabel("")
@@ -285,6 +321,7 @@ class MainWindow(QMainWindow):
 
         self.session_list = QListWidget()
         self.session_list.itemDoubleClicked.connect(lambda _item: self._load_selected_session())
+        self.session_list.installEventFilter(self)
 
         button_row = QHBoxLayout()
         self.new_session_button = QPushButton("New")
@@ -296,14 +333,17 @@ class MainWindow(QMainWindow):
 
         second_button_row = QHBoxLayout()
         self.load_selected_session_button = QPushButton("Load Selected")
+        self.delete_session_button = QPushButton("Delete")
         self.refresh_sessions_button = QPushButton("Refresh")
         second_button_row.addWidget(self.load_selected_session_button)
+        second_button_row.addWidget(self.delete_session_button)
         second_button_row.addWidget(self.refresh_sessions_button)
 
         self.new_session_button.clicked.connect(self.new_session)
         self.save_session_button.clicked.connect(lambda: self.save_session())
         self.save_session_as_button.clicked.connect(self.save_session_as)
         self.load_selected_session_button.clicked.connect(self._load_selected_session)
+        self.delete_session_button.clicked.connect(self._delete_selected_session)
         self.refresh_sessions_button.clicked.connect(self._refresh_session_list)
 
         layout.addWidget(heading)
@@ -363,12 +403,12 @@ class MainWindow(QMainWindow):
     def _update_session_indicator(self, saved: bool | None = None, message: str | None = None) -> None:
         if saved is not None:
             self._session_dirty = not saved
-        if message is None:
-            message = "Unsaved changes" if self._session_dirty else "Saved"
-        suffix = f" · {self._session_display_path()}" if self._current_session_path else ""
-        self.save_state_label.setText(f"{message}{suffix}")
+
+        display = "Unsaved changes" if self._session_dirty else "All changes saved"
+
+        self.save_state_label.setText(display)
         if hasattr(self, "session_path_label"):
-            self.session_path_label.setText(f"<b>Current:</b> {self._session_display_path()}")
+            self.session_path_label.setText(f"<b>Session folder:</b> {self._session_dir.as_posix()}")
 
     def _mark_session_dirty(self) -> None:
         if self._initializing or self._loading_session:
@@ -393,9 +433,9 @@ class MainWindow(QMainWindow):
 
         self._current_session_path = path
         self._last_saved_session_payload = payload_text
-        self._update_session_indicator(saved=True, message=status_message)
-        self.status_label.setText(f"{status_message}: {path}")
-        self.statusBar().showMessage(status_message)
+        self._update_session_indicator(saved=True)
+        self.status_label.setText(f"Saved to {path.name}.")
+        self.statusBar().showMessage(f"Saved to {path.name}")
         self._refresh_session_list()
         return True
 
@@ -403,8 +443,11 @@ class MainWindow(QMainWindow):
         if self._initializing or self._loading_session or not self._autosave_enabled:
             return
         path = self._current_session_path or (self._session_dir / "autosave.json")
-        self._update_session_indicator(message="Autosaving...")
         self._write_session_file(path, status_message="Autosaved")
+
+    def _is_hidden_session_path(self, path: Path) -> bool:
+        stem = path.stem.strip().lower()
+        return stem in {"", "autosave"} or re.fullmatch(r"session-\d{8}-\d{6}", stem) is not None
 
     def _refresh_session_list(self) -> None:
         if not hasattr(self, "session_list"):
@@ -413,7 +456,7 @@ class MainWindow(QMainWindow):
         current_path = self._current_session_path.expanduser().resolve() if self._current_session_path else None
         self.session_list.clear()
         session_paths = sorted(
-            self._session_dir.glob("*.json"),
+            (path for path in self._session_dir.glob("*.json") if not self._is_hidden_session_path(path)),
             key=lambda path: path.stat().st_mtime if path.exists() else 0,
             reverse=True,
         )
@@ -444,6 +487,41 @@ class MainWindow(QMainWindow):
         if not isinstance(path_text, str):
             return
         self._load_session_from_path(Path(path_text))
+
+    def _delete_selected_session(self) -> None:
+        item = self.session_list.currentItem()
+        if item is None:
+            return
+        path_text = item.data(Qt.UserRole)
+        if not isinstance(path_text, str):
+            return
+
+        path = Path(path_text).expanduser()
+        answer = QMessageBox.question(
+            self,
+            "Delete session?",
+            f"Delete {path.name}? This cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            resolved_path = path.resolve()
+            current_path = self._current_session_path.expanduser().resolve() if self._current_session_path else None
+            path.unlink()
+        except OSError as exc:
+            QMessageBox.warning(self, "Session delete failed", str(exc))
+            return
+
+        if current_path is not None and resolved_path == current_path:
+            self._current_session_path = None
+            self._last_saved_session_payload = ""
+            self._update_session_indicator(saved=False)
+
+        self._refresh_session_list()
+        self.status_label.setText(f"Deleted {path.name}.")
+        self.statusBar().showMessage(f"Deleted {path.name}")
 
     def _apply_session_payload(self, payload: dict) -> None:
         self.input_paths = list(payload.get("input_paths", []))
@@ -487,7 +565,7 @@ class MainWindow(QMainWindow):
         self._update_session_indicator(saved=True, message="Session loaded")
         self._refresh_session_list()
         if announce:
-            self.status_label.setText(f"Loaded session from {path}.")
+            self.status_label.setText(f"Loaded {path.name}.")
         self.request_rebuild()
         return True
 
@@ -944,11 +1022,11 @@ class MainWindow(QMainWindow):
         self.copy_button.setMinimumHeight(46)
         self.copy_button.setMinimumWidth(190)
         copy_prompt_row = QHBoxLayout()
+        copy_prompt_row.addWidget(self.copy_banner, alignment=Qt.AlignLeft)
         copy_prompt_row.addWidget(self.copy_button)
         copy_prompt_row.addStretch(1)
         prompt_layout.addWidget(prompt_heading)
         prompt_layout.addWidget(self.user_prompt_edit)
-        prompt_layout.addWidget(self.copy_banner, alignment=Qt.AlignLeft)
         prompt_layout.addLayout(copy_prompt_row)
         prompt_layout.addWidget(self.disk_note)
         root_layout.addWidget(prompt_card)
@@ -980,7 +1058,7 @@ class MainWindow(QMainWindow):
         token_layout.addWidget(self.token_breakdown_label)
         self.cancel_button = QPushButton("Cancel")
         self.cancel_button.clicked.connect(self.cancel_build)
-        self.save_state_label = QLabel("Autosave ready")
+        self.save_state_label = QLabel("Saved")
         self.save_state_label.setObjectName("saveStateLabel")
         self.save_state_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         footer.addWidget(self.status_label, 1)
@@ -1236,6 +1314,7 @@ class MainWindow(QMainWindow):
             "save_session_button",
             "save_session_as_button",
             "load_selected_session_button",
+            "delete_session_button",
             "refresh_sessions_button",
             "session_list",
         ]:
@@ -1260,16 +1339,22 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Cancelling scan...")
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # type: ignore[override]
-        if watched in {self.tree, self.flat_table} and event.type() == QEvent.Type.KeyPress:
+        if event.type() == QEvent.Type.KeyPress:
             key_event = event if isinstance(event, QKeyEvent) else None
-            if key_event is not None and key_event.key() == Qt.Key_Delete:
-                self.remove_selected()
-                event.accept()
-                return True
-            if key_event is not None and key_event.key() in {Qt.Key_Return, Qt.Key_Enter}:
-                self.include_full_selected()
-                event.accept()
-                return True
+            if watched in {self.tree, self.flat_table}:
+                if key_event is not None and key_event.key() == Qt.Key_Delete:
+                    self.remove_selected()
+                    event.accept()
+                    return True
+                if key_event is not None and key_event.key() in {Qt.Key_Return, Qt.Key_Enter}:
+                    self.include_full_selected()
+                    event.accept()
+                    return True
+            if watched == getattr(self, "session_list", None):
+                if key_event is not None and key_event.key() == Qt.Key_Delete:
+                    self._delete_selected_session()
+                    event.accept()
+                    return True
         return super().eventFilter(watched, event)
 
     def on_build_progress(self, message: str, current: int, total: int) -> None:
@@ -1285,6 +1370,7 @@ class MainWindow(QMainWindow):
     def on_build_finished(self, result: BuildResult) -> None:
         self._log("Scan complete: %d tracked file(s), %d dependency edge(s)", len(result.bundle["files"]), len(result.bundle["dependency_graph"]))
         self.workspace = result.workspace
+        self._set_session_dir(self._session_dir_for_project_root(result.workspace.project_root))
         self.current_result = result
         self._sync_current_bundle()
         self._refresh_all_views()
@@ -1983,7 +2069,7 @@ class MainWindow(QMainWindow):
         token_count = self._estimate_tokens(text)
         QApplication.clipboard().setText(text)
         self._log("Copied prompt bundle to clipboard (%d bytes)", len(text.encode("utf-8")))
-        self.copy_banner.setText(f"Prompt copied to clipboard ({token_count:,} tokens)")
+        self.copy_banner.setText(f"Copied prompt to clipboard ({token_count:,} tokens)")
         self.copy_banner.setVisible(True)
         QTimer.singleShot(5000, lambda: self.copy_banner.setVisible(False))
         self.status_label.setText("Prompt copied to clipboard.")
@@ -2017,8 +2103,42 @@ class MainWindow(QMainWindow):
         self._refresh_session_list()
         self.status_label.setText(f"New session: {self._current_session_path.name}")
 
+    def _manual_save_session_path(self) -> Path | None:
+        suggested_name = ""
+        if self._current_session_path is not None:
+            suggested_name = self._current_session_path.stem
+            if suggested_name == "autosave" or suggested_name.startswith("session-"):
+                suggested_name = ""
+
+        name, accepted = QInputDialog.getText(
+            self,
+            "Name Prompt Session",
+            "Session name:",
+            text=suggested_name,
+        )
+        if not accepted:
+            return None
+        if not name.strip():
+            QMessageBox.information(self, "Session name required", "Enter a name for this prompt session.")
+            return None
+
+        safe_name = self._safe_session_name(name)
+        target = self._session_dir / f"{safe_name}.json"
+        if target.exists():
+            answer = QMessageBox.question(
+                self,
+                "Overwrite session?",
+                f"{target.name} already exists. Overwrite it?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return None
+        return target
+
     def save_session(self) -> None:
-        path = self._current_session_path or (self._session_dir / "autosave.json")
+        path = self._manual_save_session_path()
+        if path is None:
+            return
         self._write_session_file(path, status_message="Saved")
 
     def save_session_as(self) -> None:
@@ -2058,12 +2178,29 @@ class MainWindow(QMainWindow):
             return
 
         patch_paths = [path for path in paths if self._is_patch_path(path)]
-        input_paths = [path for path in paths if not self._is_patch_path(path)]
+        non_patch_paths = [path for path in paths if not self._is_patch_path(path)]
+        session_paths = [path for path in non_patch_paths if self._looks_like_session_file(Path(path))]
+        input_paths = [path for path in non_patch_paths if path not in session_paths]
 
         if patch_paths:
             self._log("Dropped %d patch file(s) into the app", len(patch_paths))
-            for patch_path in patch_paths:
-                self._handle_patch_drop(Path(patch_path).expanduser().resolve())
+            for patch_path_text in patch_paths:
+                patch_path = Path(patch_path_text).expanduser().resolve()
+                action = self._choose_patch_drop_action(patch_path)
+                if action == "apply":
+                    self._handle_patch_drop(patch_path)
+                elif action == "import":
+                    input_paths.append(patch_path.as_posix())
+
+        if session_paths:
+            self._log("Dropped %d session file(s) into the app", len(session_paths))
+            for session_path_text in session_paths:
+                session_path = Path(session_path_text).expanduser().resolve()
+                action = self._choose_session_drop_action(session_path)
+                if action == "open":
+                    self._load_session_from_path(session_path)
+                elif action == "import":
+                    input_paths.append(session_path.as_posix())
 
         if input_paths:
             self._log("Dropped %d path(s) into the app", len(input_paths))
@@ -2073,6 +2210,59 @@ class MainWindow(QMainWindow):
 
     def _is_patch_path(self, path: str) -> bool:
         return Path(path).suffix.lower() in {".diff", ".patch"}
+
+    def _choose_patch_drop_action(self, patch_path: Path) -> str:
+        message_box = QMessageBox(self)
+        message_box.setWindowTitle("Patch file dropped")
+        message_box.setText(f"How should Prompt Builder handle {patch_path.name}?")
+        message_box.setInformativeText(
+            "Apply it as a patch to the current workspace, or import it as a normal context file."
+        )
+        apply_button = message_box.addButton("Apply patch", QMessageBox.ButtonRole.AcceptRole)
+        import_button = message_box.addButton("Import file", QMessageBox.ButtonRole.ActionRole)
+        message_box.addButton(QMessageBox.StandardButton.Cancel)
+        message_box.exec()
+
+        clicked_button = message_box.clickedButton()
+        if clicked_button == apply_button:
+            return "apply"
+        if clicked_button == import_button:
+            return "import"
+        return "cancel"
+
+    def _looks_like_session_file(self, path: Path) -> bool:
+        if path.suffix.lower() != ".json" or not path.exists() or not path.is_file():
+            return False
+        try:
+            payload = json.loads(path.expanduser().read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        return (
+            isinstance(payload, dict)
+            and isinstance(payload.get("input_paths"), list)
+            and isinstance(payload.get("prompt"), dict)
+            and isinstance(payload.get("settings"), dict)
+            and isinstance(payload.get("file_overrides", {}), dict)
+        )
+
+    def _choose_session_drop_action(self, session_path: Path) -> str:
+        message_box = QMessageBox(self)
+        message_box.setWindowTitle("Session file dropped")
+        message_box.setText(f"Open {session_path.name} as a Prompt Builder session?")
+        message_box.setInformativeText(
+            "Open it as the active session, or import it as a normal context file."
+        )
+        open_button = message_box.addButton("Open session", QMessageBox.ButtonRole.AcceptRole)
+        import_button = message_box.addButton("Import file", QMessageBox.ButtonRole.ActionRole)
+        message_box.addButton(QMessageBox.StandardButton.Cancel)
+        message_box.exec()
+
+        clicked_button = message_box.clickedButton()
+        if clicked_button == open_button:
+            return "open"
+        if clicked_button == import_button:
+            return "import"
+        return "cancel"
 
     def _run_git_apply(self, args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
