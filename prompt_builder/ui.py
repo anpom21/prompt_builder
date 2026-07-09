@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import tempfile
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QObject, Qt, QThread, QTimer, Signal, QUrl
@@ -14,6 +15,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
     QComboBox,
+    QDockWidget,
     QFileDialog,
     QFormLayout,
     QGroupBox,
@@ -21,6 +23,8 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -167,11 +171,32 @@ class MainWindow(QMainWindow):
         self._refreshing_table = False
         self._file_icon_cache: dict[str, QIcon] = {}
         self._material_icon_dir = Path(__file__).resolve().parent / "icons" / "material-icon-theme" / "icons"
+        self._session_dir = self._default_session_dir()
+        self._current_session_path: Path | None = self._session_dir / "autosave.json"
+        self._last_saved_session_payload = ""
+        self._session_dirty = False
+        self._autosave_enabled = True
+        self._loading_session = False
+        self._initializing = True
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setSingleShot(True)
+        self._autosave_timer.setInterval(1000)
+        self._autosave_timer.timeout.connect(self._autosave_session)
+        self._settings_rebuild_timer = QTimer(self)
+        self._settings_rebuild_timer.setSingleShot(True)
+        self._settings_rebuild_timer.setInterval(700)
+        self._settings_rebuild_timer.timeout.connect(self.request_rebuild)
 
         self._build_menu_bar()
         self._build_ui()
         self._sync_settings_controls()
-        if self.input_paths:
+        self._initializing = False
+        self._refresh_session_list()
+        self._update_session_indicator(saved=True, message="Autosave ready")
+        loaded_initial_session = False
+        if not self.input_paths:
+            loaded_initial_session = self._load_initial_session()
+        if self.input_paths and not loaded_initial_session:
             self._log("Loaded %d startup path(s)", len(self.input_paths))
             self.request_rebuild()
 
@@ -182,8 +207,12 @@ class MainWindow(QMainWindow):
         self.add_folder_action = QAction("Add Folder...", self)
         self.refresh_action = QAction("Refresh", self)
         self.copy_action = QAction("Copy Prompt", self)
+        self.new_session_action = QAction("New Session", self)
         self.save_session_action = QAction("Save Session", self)
-        self.load_session_action = QAction("Load Session", self)
+        self.save_session_as_action = QAction("Save Session As...", self)
+        self.load_session_action = QAction("Load Session...", self)
+        self.sessions_action = QAction("Sessions", self)
+        self.sessions_action.setCheckable(True)
         self.export_action = QAction("Export JSON...", self)
         self.reset_action = QAction("Reset", self)
         self.settings_action = QAction("Settings", self)
@@ -196,8 +225,15 @@ class MainWindow(QMainWindow):
             self.add_folder_action,
             self.refresh_action,
             self.copy_action,
+        ]:
+            file_menu.addAction(action)
+        file_menu.addSeparator()
+        for action in [
+            self.new_session_action,
             self.save_session_action,
+            self.save_session_as_action,
             self.load_session_action,
+            self.sessions_action,
             self.export_action,
         ]:
             file_menu.addAction(action)
@@ -208,6 +244,261 @@ class MainWindow(QMainWindow):
     def _log(self, message: str, *args: object) -> None:
         if self.verbose:
             logger.info(message, *args)
+
+    @staticmethod
+    def _default_session_dir() -> Path:
+        return Path.home() / ".prompt_builder" / "sessions"
+
+    def _safe_session_name(self, name: str) -> str:
+        safe = "".join(char if char.isalnum() or char in {"-", "_"} else "-" for char in name.strip().lower())
+        safe = "-".join(part for part in safe.split("-") if part)
+        return safe or "session"
+
+    def _timestamped_session_path(self, prefix: str = "session") -> Path:
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        return self._session_dir / f"{self._safe_session_name(prefix)}-{timestamp}.json"
+
+    def _build_sessions_dock(self) -> None:
+        self.sessions_dock = QDockWidget("Prompt Sessions", self)
+        self.sessions_dock.setObjectName("sessionsDock")
+        self.sessions_dock.setAllowedAreas(Qt.RightDockWidgetArea)
+        self.sessions_dock.setFeatures(
+            QDockWidget.DockWidgetFeature.DockWidgetClosable
+            | QDockWidget.DockWidgetFeature.DockWidgetMovable
+        )
+
+        panel = QFrame()
+        panel.setObjectName("sessionsCard")
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        heading = QLabel("Prompt Sessions")
+        heading.setObjectName("sectionLabel")
+        hint = QLabel("Autosave writes the current session after one second of no edits. Double-click a session to switch.")
+        hint.setObjectName("hintLabel")
+        hint.setWordWrap(True)
+        self.session_path_label = QLabel("")
+        self.session_path_label.setObjectName("sessionPathLabel")
+        self.session_path_label.setWordWrap(True)
+        self.session_path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+
+        self.session_list = QListWidget()
+        self.session_list.itemDoubleClicked.connect(lambda _item: self._load_selected_session())
+
+        button_row = QHBoxLayout()
+        self.new_session_button = QPushButton("New")
+        self.save_session_button = QPushButton("Save")
+        self.save_session_as_button = QPushButton("Save As...")
+        button_row.addWidget(self.new_session_button)
+        button_row.addWidget(self.save_session_button)
+        button_row.addWidget(self.save_session_as_button)
+
+        second_button_row = QHBoxLayout()
+        self.load_selected_session_button = QPushButton("Load Selected")
+        self.refresh_sessions_button = QPushButton("Refresh")
+        second_button_row.addWidget(self.load_selected_session_button)
+        second_button_row.addWidget(self.refresh_sessions_button)
+
+        self.new_session_button.clicked.connect(self.new_session)
+        self.save_session_button.clicked.connect(lambda: self.save_session())
+        self.save_session_as_button.clicked.connect(self.save_session_as)
+        self.load_selected_session_button.clicked.connect(self._load_selected_session)
+        self.refresh_sessions_button.clicked.connect(self._refresh_session_list)
+
+        layout.addWidget(heading)
+        layout.addWidget(hint)
+        layout.addWidget(self.session_path_label)
+        layout.addWidget(self.session_list, 1)
+        layout.addLayout(button_row)
+        layout.addLayout(second_button_row)
+
+        self.sessions_dock.setWidget(panel)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.sessions_dock)
+        self.sessions_dock.hide()
+        self.sessions_dock.visibilityChanged.connect(self._on_sessions_visibility_changed)
+
+    def _on_sessions_visibility_changed(self, visible: bool) -> None:
+        self.sessions_button.setText("×" if visible else "☰")
+        self.sessions_action.setChecked(visible)
+        if visible:
+            self._refresh_session_list()
+
+    def toggle_sessions_panel(self) -> None:
+        self.sessions_dock.setVisible(not self.sessions_dock.isVisible())
+
+    def _session_display_path(self) -> str:
+        if self._current_session_path is None:
+            return "No session file selected"
+        try:
+            return self._current_session_path.expanduser().resolve().as_posix()
+        except OSError:
+            return self._current_session_path.as_posix()
+
+    def _session_payload(self) -> dict:
+        state = SessionState(
+            input_paths=list(self.input_paths),
+            prompt={
+                "llm_task": {
+                    "mode": "custom" if self.system_template_combo.currentData() == "custom" else "template",
+                    "template_id": self.system_template_combo.currentData(),
+                    "custom_text": self.custom_system_prompt.toPlainText(),
+                },
+                "user_prompt": self.user_prompt_edit.toPlainText(),
+            },
+            settings={
+                **asdict(self.current_settings()),
+                "show_skipped_dependencies": self.show_skipped_dependencies_check.isChecked(),
+                "autosave_enabled": self._autosave_enabled,
+            },
+            file_overrides=dict(self.file_overrides),
+        )
+        payload = asdict(state)
+        payload["session_file"] = self._session_display_path()
+        return payload
+
+    def _session_payload_text(self) -> str:
+        return json.dumps(self._session_payload(), indent=2, ensure_ascii=False)
+
+    def _update_session_indicator(self, saved: bool | None = None, message: str | None = None) -> None:
+        if saved is not None:
+            self._session_dirty = not saved
+        if message is None:
+            message = "Unsaved changes" if self._session_dirty else "Saved"
+        suffix = f" · {self._session_display_path()}" if self._current_session_path else ""
+        self.save_state_label.setText(f"{message}{suffix}")
+        if hasattr(self, "session_path_label"):
+            self.session_path_label.setText(f"<b>Current:</b> {self._session_display_path()}")
+
+    def _mark_session_dirty(self) -> None:
+        if self._initializing or self._loading_session:
+            return
+        self._session_dirty = True
+        self._update_session_indicator(message="Unsaved changes")
+        if self._autosave_enabled:
+            self._autosave_timer.start()
+
+    def _write_session_file(self, path: Path, *, status_message: str = "Saved") -> bool:
+        try:
+            path = path.expanduser()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload_text = self._session_payload_text()
+            temp_path = path.with_suffix(path.suffix + ".tmp")
+            temp_path.write_text(payload_text, encoding="utf-8")
+            temp_path.replace(path)
+        except OSError as exc:
+            QMessageBox.warning(self, "Session save failed", str(exc))
+            self._update_session_indicator(saved=False, message="Save failed")
+            return False
+
+        self._current_session_path = path
+        self._last_saved_session_payload = payload_text
+        self._update_session_indicator(saved=True, message=status_message)
+        self.status_label.setText(f"{status_message}: {path}")
+        self.statusBar().showMessage(status_message)
+        self._refresh_session_list()
+        return True
+
+    def _autosave_session(self) -> None:
+        if self._initializing or self._loading_session or not self._autosave_enabled:
+            return
+        path = self._current_session_path or (self._session_dir / "autosave.json")
+        self._update_session_indicator(message="Autosaving...")
+        self._write_session_file(path, status_message="Autosaved")
+
+    def _refresh_session_list(self) -> None:
+        if not hasattr(self, "session_list"):
+            return
+        self._session_dir.mkdir(parents=True, exist_ok=True)
+        current_path = self._current_session_path.expanduser().resolve() if self._current_session_path else None
+        self.session_list.clear()
+        session_paths = sorted(
+            self._session_dir.glob("*.json"),
+            key=lambda path: path.stat().st_mtime if path.exists() else 0,
+            reverse=True,
+        )
+        for path in session_paths:
+            display = path.stem
+            try:
+                resolved = path.expanduser().resolve()
+            except OSError:
+                resolved = path
+            if current_path is not None and resolved == current_path:
+                display = f"{display}  • current"
+            item = QListWidgetItem(display)
+            item.setData(Qt.UserRole, path.as_posix())
+            item.setToolTip(path.as_posix())
+            self.session_list.addItem(item)
+        self._update_session_indicator()
+
+    def _load_initial_session(self) -> bool:
+        if self._current_session_path is None or not self._current_session_path.exists():
+            return False
+        return self._load_session_from_path(self._current_session_path, announce=False)
+
+    def _load_selected_session(self) -> None:
+        item = self.session_list.currentItem()
+        if item is None:
+            return
+        path_text = item.data(Qt.UserRole)
+        if not isinstance(path_text, str):
+            return
+        self._load_session_from_path(Path(path_text))
+
+    def _apply_session_payload(self, payload: dict) -> None:
+        self.input_paths = list(payload.get("input_paths", []))
+        prompt = payload.get("prompt", {})
+        llm_task = prompt.get("llm_task", prompt.get("system", {}))
+        template_id = llm_task.get("template_id", "code_editing")
+        index = self.system_template_combo.findData(template_id)
+        if index < 0:
+            index = self.system_template_combo.findData("custom")
+        self.system_template_combo.setCurrentIndex(index)
+        self.custom_system_prompt.setPlainText(llm_task.get("custom_text", ""))
+        self.user_prompt_edit.setPlainText(prompt.get("user_prompt", ""))
+        settings = payload.get("settings", {})
+        self.project_root_edit.setText(settings.get("project_root_override", ""))
+        self.import_roots_edit.setText(", ".join(settings.get("import_root_overrides", [])))
+        self.max_depth_spin.setValue(0 if settings.get("max_dependency_depth") is None else int(settings.get("max_dependency_depth", 5)))
+        self.large_file_spin.setValue(int(settings.get("large_file_threshold", 256 * 1024)))
+        self.truncation_spin.setValue(int(settings.get("truncation_size", 40 * 1024)))
+        self.include_hidden_check.setChecked(bool(settings.get("include_hidden", False)))
+        self.include_unchecked_folder_check.setChecked(bool(settings.get("include_unchecked_folder_files", False)))
+        self.show_skipped_dependencies_check.setChecked(bool(settings.get("show_skipped_dependencies", False)))
+        self._autosave_enabled = bool(settings.get("autosave_enabled", True))
+        self.file_overrides = dict(payload.get("file_overrides", {}))
+
+    def _load_session_from_path(self, path: Path, *, announce: bool = True) -> bool:
+        try:
+            payload = json.loads(path.expanduser().read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            QMessageBox.warning(self, "Session load failed", str(exc))
+            return False
+
+        self._loading_session = True
+        try:
+            self._apply_session_payload(payload)
+            self._current_session_path = path.expanduser()
+            self._last_saved_session_payload = self._session_payload_text()
+        finally:
+            self._loading_session = False
+
+        self._update_input_summary()
+        self._update_session_indicator(saved=True, message="Session loaded")
+        self._refresh_session_list()
+        if announce:
+            self.status_label.setText(f"Loaded session from {path}.")
+        self.request_rebuild()
+        return True
+
+    def _on_build_settings_changed(self, *_: object) -> None:
+        self._mark_session_dirty()
+        if self._initializing or self._loading_session:
+            return
+        if self.input_paths:
+            self._settings_rebuild_timer.start()
+        else:
+            self._sync_current_bundle()
 
     def _apply_default_settings(self) -> None:
         self.max_depth_spin.setValue(DEFAULT_MAX_DEPENDENCY_DEPTH if DEFAULT_MAX_DEPENDENCY_DEPTH is not None else 0)
@@ -251,7 +542,34 @@ class MainWindow(QMainWindow):
             QMenu::item:selected {
                 background: #0ea5e9;
             }
-            QFrame#heroCard, QFrame#card {
+            QDialog, QMessageBox, QFileDialog, QDockWidget {
+                background: #0b1220;
+                color: #e2e8f0;
+            }
+            QDockWidget::title {
+                background: #0f172a;
+                color: #f8fafc;
+                padding: 8px;
+                border-bottom: 1px solid rgba(148, 163, 184, 0.18);
+            }
+            QMessageBox QLabel, QDialog QLabel, QFileDialog QLabel {
+                color: #e2e8f0;
+            }
+            QFileDialog QListView, QFileDialog QTreeView, QFileDialog QSidebar, QListWidget {
+                background: #111827;
+                color: #e5e7eb;
+                border: 1px solid rgba(148, 163, 184, 0.22);
+                border-radius: 10px;
+            }
+            QListWidget::item {
+                padding: 8px;
+                border-radius: 8px;
+            }
+            QListWidget::item:selected {
+                background: #0ea5e9;
+                color: white;
+            }
+            QFrame#heroCard, QFrame#card, QFrame#sessionsCard {
                 background: rgba(15, 23, 42, 0.88);
                 border: 1px solid rgba(148, 163, 184, 0.18);
                 border-radius: 18px;
@@ -311,6 +629,18 @@ class MainWindow(QMainWindow):
             }
             QPushButton:pressed {
                 background: #0f172a;
+            }
+            QPushButton#iconButton {
+                font-size: 16px;
+                font-weight: 800;
+                padding: 8px 10px;
+            }
+            QLabel#saveStateLabel, QLabel#sessionPathLabel {
+                padding: 6px 10px;
+                background: rgba(30, 41, 59, 0.72);
+                border: 1px solid rgba(148, 163, 184, 0.16);
+                border-radius: 8px;
+                color: #cbd5e1;
             }
             QPushButton#primaryAction {
                 background: #0ea5e9;
@@ -430,8 +760,13 @@ class MainWindow(QMainWindow):
         button_row = QHBoxLayout()
         self.settings_button = QPushButton("Settings")
         self.reset_button = QPushButton("Reset")
+        self.sessions_button = QPushButton("☰")
+        self.sessions_button.setObjectName("iconButton")
+        self.sessions_button.setToolTip("Show prompt sessions")
+        self.sessions_button.setFixedWidth(46)
         button_row.addWidget(self.settings_button)
         button_row.addWidget(self.reset_button)
+        button_row.addWidget(self.sessions_button)
         button_row.addStretch(1)
 
         header_layout.addLayout(title_stack, 2)
@@ -645,7 +980,11 @@ class MainWindow(QMainWindow):
         token_layout.addWidget(self.token_breakdown_label)
         self.cancel_button = QPushButton("Cancel")
         self.cancel_button.clicked.connect(self.cancel_build)
+        self.save_state_label = QLabel("Autosave ready")
+        self.save_state_label.setObjectName("saveStateLabel")
+        self.save_state_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         footer.addWidget(self.status_label, 1)
+        footer.addWidget(self.save_state_label, 1)
         footer.addLayout(token_layout, 4)
         footer.addWidget(self.cancel_button)
         root_layout.addWidget(footer_card)
@@ -654,19 +993,40 @@ class MainWindow(QMainWindow):
         self.add_folder_action.triggered.connect(lambda: self.add_folder())
         self.refresh_action.triggered.connect(lambda: self.request_rebuild())
         self.copy_action.triggered.connect(lambda: self.copy_json())
+        self.new_session_action.triggered.connect(self.new_session)
         self.save_session_action.triggered.connect(lambda: self.save_session())
+        self.save_session_as_action.triggered.connect(lambda: self.save_session_as())
         self.load_session_action.triggered.connect(lambda: self.load_session())
+        self.sessions_action.triggered.connect(lambda: self.toggle_sessions_panel())
         self.export_action.triggered.connect(lambda: self.export_json())
         self.reset_action.triggered.connect(lambda: self.reset_session())
         self.settings_action.triggered.connect(lambda: self.toggle_settings_panel())
         self.settings_button.clicked.connect(self.toggle_settings_panel)
+        self.sessions_button.clicked.connect(self.toggle_sessions_panel)
         self.reset_button.clicked.connect(self.reset_session)
         self.copy_button.clicked.connect(self.copy_json)
         self.show_skipped_dependencies_check.clicked.connect(self._on_show_skipped_dependencies_changed)
+        for widget in [
+            self.project_root_edit,
+            self.import_roots_edit,
+        ]:
+            widget.textChanged.connect(self._on_build_settings_changed)
+        for widget in [
+            self.max_depth_spin,
+            self.large_file_spin,
+            self.truncation_spin,
+        ]:
+            widget.valueChanged.connect(self._on_build_settings_changed)
+        for widget in [
+            self.include_hidden_check,
+            self.include_unchecked_folder_check,
+        ]:
+            widget.clicked.connect(self._on_build_settings_changed)
 
         self._apply_default_settings()
-        self._apply_styles()
         self.setCentralWidget(central)
+        self._build_sessions_dock()
+        self._apply_styles()
         self.statusBar().setSizeGripEnabled(False)
         self.statusBar().showMessage("Ready")
 
@@ -692,10 +1052,12 @@ class MainWindow(QMainWindow):
         self._log("Settings panel %s", "opened" if self.settings_panel.isVisible() else "hidden")
 
     def _on_show_skipped_dependencies_changed(self) -> None:
+        self._mark_session_dirty()
         self.refresh_tree()
 
     def _reset_settings_defaults(self) -> None:
         self._apply_default_settings()
+        self._mark_session_dirty()
         self._log("Reset settings to defaults")
 
     def _set_system_template_preview(self) -> None:
@@ -713,6 +1075,7 @@ class MainWindow(QMainWindow):
 
     def _on_prompt_fields_changed(self) -> None:
         self._set_system_template_preview()
+        self._mark_session_dirty()
         if self.workspace is None:
             self._update_token_count()
             return
@@ -777,6 +1140,7 @@ class MainWindow(QMainWindow):
         self._update_token_count(0, 0)
         self.status_label.setText("Ready.")
         self.statusBar().showMessage("Reset complete")
+        self._mark_session_dirty()
 
     def request_rebuild(self) -> None:
         if not self.input_paths:
@@ -835,8 +1199,11 @@ class MainWindow(QMainWindow):
             self.add_folder_action,
             self.refresh_action,
             self.copy_action,
+            self.new_session_action,
             self.save_session_action,
+            self.save_session_as_action,
             self.load_session_action,
+            self.sessions_action,
             self.export_action,
             self.reset_action,
             self.settings_action,
@@ -845,6 +1212,7 @@ class MainWindow(QMainWindow):
         for widget in [
             self.settings_button,
             self.reset_button,
+            self.sessions_button,
             self.copy_button,
             self.reset_settings_button,
             self.project_root_edit,
@@ -863,6 +1231,17 @@ class MainWindow(QMainWindow):
             self.flat_table,
         ]:
             widget.setEnabled(enabled)
+        for attribute in [
+            "new_session_button",
+            "save_session_button",
+            "save_session_as_button",
+            "load_selected_session_button",
+            "refresh_sessions_button",
+            "session_list",
+        ]:
+            widget = getattr(self, attribute, None)
+            if widget is not None:
+                widget.setEnabled(enabled)
 
     def _cleanup_worker(self) -> None:
         self._worker = None
@@ -1486,6 +1865,10 @@ class MainWindow(QMainWindow):
             if target_id in excluded_now or target_id not in self.workspace.files:
                 continue
 
+            target_record = self.workspace.files[target_id]
+            if target_record.context_type == "file_from_user" or target_record.source_kind == "direct_file":
+                continue
+
             parents = parent_map.get(target_id, set())
             has_included_parent = False
             for parent_id in parents:
@@ -1510,6 +1893,7 @@ class MainWindow(QMainWindow):
         if mode == "excluded":
             self._cascade_excluded_dependencies(file_id)
         self._refresh_all_views()
+        self._mark_session_dirty()
 
     def add_files(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(self, "Add files")
@@ -1533,6 +1917,7 @@ class MainWindow(QMainWindow):
                 self._log("Queued input path: %s", path)
         self._update_input_summary()
         self.status_label.setText(f"{len(self.input_paths)} input paths.")
+        self._mark_session_dirty()
         self.request_rebuild()
 
     def remove_selected(self) -> None:
@@ -1570,6 +1955,7 @@ class MainWindow(QMainWindow):
         self.detail_label.setText("Select a file to inspect it here.")
         self._update_input_summary()
 
+        self._mark_session_dirty()
         if removed_input_path:
             self.request_rebuild()
         else:
@@ -1625,57 +2011,41 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Invalid bundle", str(exc))
             return None
 
+    def new_session(self) -> None:
+        self._current_session_path = self._timestamped_session_path("session")
+        self.reset_session()
+        self._refresh_session_list()
+        self.status_label.setText(f"New session: {self._current_session_path.name}")
+
     def save_session(self) -> None:
-        path, _ = QFileDialog.getSaveFileName(self, "Save Session", filter="Prompt Session (*.json)")
+        path = self._current_session_path or (self._session_dir / "autosave.json")
+        self._write_session_file(path, status_message="Saved")
+
+    def save_session_as(self) -> None:
+        suggested = self._current_session_path or self._timestamped_session_path("session")
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Session As",
+            str(suggested),
+            "Prompt Session (*.json)",
+        )
         if not path:
             return
-        state = SessionState(
-            input_paths=list(self.input_paths),
-            prompt={
-                "llm_task": {
-                    "mode": "custom" if self.system_template_combo.currentData() == "custom" else "template",
-                    "template_id": self.system_template_combo.currentData(),
-                    "custom_text": self.custom_system_prompt.toPlainText(),
-                },
-                "user_prompt": self.user_prompt_edit.toPlainText(),
-            },
-            settings={
-                **asdict(self.current_settings()),
-                "show_skipped_dependencies": self.show_skipped_dependencies_check.isChecked(),
-            },
-            file_overrides=dict(self.file_overrides),
-        )
-        Path(path).write_text(json.dumps(asdict(state), indent=2, ensure_ascii=False), encoding="utf-8")
-        self.status_label.setText(f"Session saved to {path}.")
+        target = Path(path)
+        if target.suffix.lower() != ".json":
+            target = target.with_suffix(".json")
+        self._write_session_file(target, status_message="Saved")
 
     def load_session(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Load Session", filter="Prompt Session (*.json)")
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load Session",
+            str(self._session_dir),
+            "Prompt Session (*.json)",
+        )
         if not path:
             return
-        payload = json.loads(Path(path).read_text(encoding="utf-8"))
-        self.input_paths = list(payload.get("input_paths", []))
-        prompt = payload.get("prompt", {})
-        llm_task = prompt.get("llm_task", prompt.get("system", {}))
-        template_id = llm_task.get("template_id", "code_editing")
-        index = self.system_template_combo.findData(template_id)
-        if index < 0:
-            index = self.system_template_combo.findData("custom")
-        self.system_template_combo.setCurrentIndex(index)
-        self.custom_system_prompt.setPlainText(llm_task.get("custom_text", ""))
-        self.user_prompt_edit.setPlainText(prompt.get("user_prompt", ""))
-        settings = payload.get("settings", {})
-        self.project_root_edit.setText(settings.get("project_root_override", ""))
-        self.import_roots_edit.setText(", ".join(settings.get("import_root_overrides", [])))
-        self.max_depth_spin.setValue(0 if settings.get("max_dependency_depth") is None else int(settings.get("max_dependency_depth", 5)))
-        self.large_file_spin.setValue(int(settings.get("large_file_threshold", 256 * 1024)))
-        self.truncation_spin.setValue(int(settings.get("truncation_size", 40 * 1024)))
-        self.include_hidden_check.setChecked(bool(settings.get("include_hidden", False)))
-        self.include_unchecked_folder_check.setChecked(bool(settings.get("include_unchecked_folder_files", False)))
-        self.show_skipped_dependencies_check.setChecked(bool(settings.get("show_skipped_dependencies", False)))
-        self.file_overrides = dict(payload.get("file_overrides", {}))
-        self._update_input_summary()
-        self.status_label.setText(f"Loaded session from {path}.")
-        self.request_rebuild()
+        self._load_session_from_path(Path(path))
 
     def dragEnterEvent(self, event) -> None:  # type: ignore[override]
         if event.mimeData().hasUrls() or event.mimeData().hasText():

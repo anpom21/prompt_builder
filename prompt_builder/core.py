@@ -741,9 +741,17 @@ def _ensure_record(
         for parent_id in parent_ids:
             if parent_id not in existing.parent_ids:
                 existing.parent_ids.append(parent_id)
-        existing.is_dependency = existing.is_dependency or is_dependency
-        if existing.context_type == "file_from_user" and context_type != "file_from_user":
-            existing.context_type = context_type
+        if (
+            context_type == "file_from_user"
+            or source_kind == "direct_file"
+            or existing.context_type == "file_from_user"
+            or existing.source_kind == "direct_file"
+        ):
+            existing.context_type = "file_from_user"
+            existing.source_kind = "direct_file"
+            existing.is_dependency = False
+        else:
+            existing.is_dependency = existing.is_dependency or is_dependency
         node = _make_tree_node(existing, reused=True)
         return existing, node
 
