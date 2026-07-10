@@ -11,8 +11,8 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QObject, Qt, QThread, QTimer, Signal, QUrl
-from PySide6.QtGui import QAction, QColor, QFontDatabase, QIcon, QKeyEvent, QKeySequence, QPainter
+from PySide6.QtCore import QEvent, QObject, Qt, QThread, QTimer, Signal, QUrl, QRegularExpression
+from PySide6.QtGui import QAction, QColor, QFontDatabase, QIcon, QKeyEvent, QKeySequence, QPainter, QSyntaxHighlighter, QTextCharFormat
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -43,6 +43,7 @@ from PySide6.QtWidgets import (
     QTableWidgetItem,
     QTreeWidget,
     QTreeWidgetItem,
+    QTreeWidgetItemIterator,
     QVBoxLayout,
     QWidget,
 )
@@ -58,14 +59,18 @@ from .core import (
     PromptFields,
     PromptTemplateMode,
     LLM_TASK_TEMPLATES,
+    IMAGE_EXTENSIONS,
     TreeNode,
     build_context_structure,
+    render_record_content,
     serialize_bundle,
+    set_record_inclusion_mode,
 )
 
 logger = logging.getLogger(__name__)
 
 SESSION_DIR_NAME = ".context_sessions"
+SKILLS_DIR = Path.home() / ".context_builder" / "skills"
 
 
 @dataclass(slots=True)
@@ -156,6 +161,47 @@ class TokenBarWidget(QWidget):
             remaining_width -= width
 
 
+class FileSyntaxHighlighter(QSyntaxHighlighter):
+    def __init__(self, document) -> None:
+        super().__init__(document)
+        self._rules: list[tuple[QRegularExpression, QTextCharFormat]] = []
+
+    def set_filename(self, filename: str) -> None:
+        suffix = Path(filename).suffix.lower()
+        self._rules = []
+
+        def add(pattern: str, color: str, *, bold: bool = False) -> None:
+            text_format = QTextCharFormat()
+            text_format.setForeground(QColor(color))
+            text_format.setFontWeight(700 if bold else 400)
+            self._rules.append((QRegularExpression(pattern), text_format))
+
+        add(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'', "#a7f3d0")
+        add(r"\b\d+(?:\.\d+)?\b", "#fbbf24")
+        add(r"#[^\n]*", "#64748b")
+
+        if suffix in {".py", ".pyi"}:
+            add(r"\b(?:and|as|assert|async|await|break|class|continue|def|del|elif|else|except|False|finally|for|from|global|if|import|in|is|lambda|None|nonlocal|not|or|pass|raise|return|True|try|while|with|yield)\b", "#c4b5fd", bold=True)
+            add(r"\b(?:self|cls)\b", "#7dd3fc")
+        elif suffix in {".json", ".yaml", ".yml", ".toml"}:
+            add(r'^\s*["\']?[^"\':=\n]+["\']?\s*(?=[:=])', "#7dd3fc", bold=True)
+        elif suffix in {".md", ".rst"}:
+            add(r"^#{1,6}.*$", "#7dd3fc", bold=True)
+            add(r"`[^`]+`", "#fda4af")
+        elif suffix in {".diff", ".patch"}:
+            add(r"^\+.*$", "#86efac")
+            add(r"^-.*$", "#fca5a5")
+            add(r"^@@.*$", "#7dd3fc", bold=True)
+        self.rehighlight()
+
+    def highlightBlock(self, text: str) -> None:  # type: ignore[override]
+        for expression, text_format in self._rules:
+            iterator = expression.globalMatch(text)
+            while iterator.hasNext():
+                match = iterator.next()
+                self.setFormat(match.capturedStart(), match.capturedLength(), text_format)
+
+
 class MainWindow(QMainWindow):
     def __init__(
         self,
@@ -178,10 +224,12 @@ class MainWindow(QMainWindow):
         self._worker_thread: QThread | None = None
         self._worker: BuildWorker | None = None
         self._pending_rebuild = False
+        self._pending_image_inclusion: dict[str, bool] = {}
         self._refreshing_tree = False
         self._refreshing_table = False
         self._file_icon_cache: dict[str, QIcon] = {}
         self._material_icon_dir = Path(__file__).resolve().parent / "icons" / "material-icon-theme" / "icons"
+        self._skill_prompts: dict[str, str] = {}
         self._session_dir = self._default_session_dir()
         self._initial_session_path = Path(session_path).expanduser() if session_path else None
         self._current_session_path: Path | None = self._session_dir / "autosave.json"
@@ -1013,18 +1061,12 @@ class MainWindow(QMainWindow):
         self.preview.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.preview.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.preview.setFont(QFontDatabase.systemFont(QFontDatabase.FixedFont))
+        self.preview_highlighter = FileSyntaxHighlighter(self.preview.document())
         preview_layout.addWidget(self.detail_label)
         preview_layout.addWidget(self.preview, 1)
         self.preview_tabs.addTab(preview_page, "Preview")
 
-        overview_page = QWidget()
-        overview_layout = QVBoxLayout(overview_page)
-        self.bundle_summary = QLabel("Bundle summary will appear here after a scan.")
-        self.bundle_summary.setObjectName("overviewSummary")
-        self.bundle_summary.setWordWrap(True)
-        self.bundle_summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        overview_layout.addWidget(self.bundle_summary, 1)
-        self.preview_tabs.addTab(overview_page, "Overview")
+        self.bundle_summary = QLabel()
 
         task_card = QFrame()
         task_card.setObjectName("card")
@@ -1036,7 +1078,16 @@ class MainWindow(QMainWindow):
         self.system_template_combo = QComboBox()
         for template_id in list(LLM_TASK_TEMPLATES.keys()) + ["custom"]:
             self.system_template_combo.addItem(template_id.replace("_", " ").title(), template_id)
+        self.import_skill_button = QPushButton("+")
+        self.import_skill_button.setObjectName("iconButton")
+        self.import_skill_button.setFixedWidth(42)
+        self.import_skill_button.setToolTip("Import an agent skill markdown file")
+        task_selector_row = QHBoxLayout()
+        task_selector_row.addWidget(self.system_template_combo, 1)
+        task_selector_row.addWidget(self.import_skill_button)
+        self._reload_skills()
         self.system_template_combo.currentIndexChanged.connect(self._on_system_template_changed)
+        self.import_skill_button.clicked.connect(self._import_skill)
         self.custom_system_prompt = QPlainTextEdit()
         self.custom_system_prompt.setPlaceholderText("Write a custom LLM task here.")
         self.custom_system_prompt.setMinimumHeight(130)
@@ -1047,7 +1098,7 @@ class MainWindow(QMainWindow):
         self.system_preview.setWordWrap(True)
         self.system_preview.setObjectName("resolvedPrompt")
         task_layout.addWidget(task_heading)
-        task_layout.addWidget(self.system_template_combo)
+        task_layout.addLayout(task_selector_row)
         task_layout.addWidget(self.custom_system_prompt, 2)
         task_layout.addWidget(resolved_label)
         task_layout.addWidget(self.system_preview, 1)
@@ -1199,13 +1250,84 @@ class MainWindow(QMainWindow):
         self._mark_session_dirty()
         self._log("Reset settings to defaults")
 
+    def _parse_skill_file(self, path: Path) -> tuple[str, str] | None:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        name = path.stem
+        description = ""
+        if text.startswith("---"):
+            end = text.find("\n---", 3)
+            if end >= 0:
+                frontmatter = text[3:end].strip()
+                for line in frontmatter.splitlines():
+                    key, sep, value = line.partition(":")
+                    if not sep:
+                        continue
+                    if key.strip() == "name" and value.strip():
+                        name = value.strip().strip('"\'')
+                    elif key.strip() == "description":
+                        description = value.strip().strip('"\'')
+        return name, text.strip()
+
+    def _reload_skills(self, select_name: str | None = None) -> None:
+        current = self.system_template_combo.currentData() if hasattr(self, "system_template_combo") else None
+        while self.system_template_combo.count() > len(LLM_TASK_TEMPLATES) + 1:
+            self.system_template_combo.removeItem(self.system_template_combo.count() - 1)
+        self._skill_prompts.clear()
+        SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+        for path in sorted(SKILLS_DIR.glob("*.md")):
+            parsed = self._parse_skill_file(path)
+            if parsed is None:
+                continue
+            name, text = parsed
+            key = f"skill:{path.as_posix()}"
+            self._skill_prompts[key] = text
+            self.system_template_combo.addItem(name, key)
+        target = select_name or current
+        if target is not None:
+            index = self.system_template_combo.findData(target)
+            if index >= 0:
+                self.system_template_combo.setCurrentIndex(index)
+
+    def _import_skill(self) -> None:
+        path_text, _ = QFileDialog.getOpenFileName(self, "Import agent skill", filter="Markdown Files (*.md)")
+        if not path_text:
+            return
+        source = Path(path_text).expanduser()
+        parsed = self._parse_skill_file(source)
+        if parsed is None:
+            QMessageBox.warning(self, "Skill import failed", f"Could not read {source}")
+            return
+        name, _text = parsed
+        SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-.") or source.stem
+        target = SKILLS_DIR / f"{safe_name}.md"
+        try:
+            shutil.copy2(source, target)
+        except OSError as exc:
+            QMessageBox.warning(self, "Skill import failed", str(exc))
+            return
+        self._reload_skills(select_name=f"skill:{target.as_posix()}")
+        self._on_prompt_fields_changed()
+
     def _set_system_template_preview(self) -> None:
         template_id = self.system_template_combo.currentData()
-        if template_id == "custom":
+        if isinstance(template_id, str) and template_id.startswith("skill:"):
+            self.custom_system_prompt.setVisible(False)
+            self.custom_system_prompt.setEnabled(False)
+            self.system_preview.setVisible(True)
+            preview = self._skill_prompts.get(template_id, "")
+        elif template_id == "custom":
+            self.custom_system_prompt.setVisible(True)
             self.custom_system_prompt.setEnabled(True)
+            self.system_preview.setVisible(False)
             preview = self.custom_system_prompt.toPlainText().strip() or "Custom LLM task mode."
         else:
+            self.custom_system_prompt.setVisible(False)
             self.custom_system_prompt.setEnabled(False)
+            self.system_preview.setVisible(True)
             preview = LLM_TASK_TEMPLATES.get(template_id, LLM_TASK_TEMPLATES["code_editing"])
         self.system_preview.setText(preview)
 
@@ -1224,12 +1346,13 @@ class MainWindow(QMainWindow):
 
     def current_prompt_fields(self) -> PromptFields:
         template_id = str(self.system_template_combo.currentData())
-        mode = "custom" if template_id == "custom" else "template"
+        is_skill = template_id.startswith("skill:")
+        mode = "custom" if template_id == "custom" or is_skill else "template"
         return PromptFields(
             llm_task=PromptTemplateMode(
                 mode=mode,
-                template_id=template_id if template_id != "custom" else "code_editing",
-                custom_text=self.custom_system_prompt.toPlainText(),
+                template_id=template_id if template_id != "custom" and not is_skill else "code_editing",
+                custom_text=self._skill_prompts.get(template_id, "") if is_skill else self.custom_system_prompt.toPlainText(),
             ),
             user_prompt=self.user_prompt_edit.toPlainText(),
         )
@@ -1364,6 +1487,7 @@ class MainWindow(QMainWindow):
             self.show_skipped_dependencies_check,
             self.user_prompt_edit,
             self.system_template_combo,
+            self.import_skill_button,
             self.custom_system_prompt,
             self.search_edit,
             self.tree,
@@ -1431,11 +1555,17 @@ class MainWindow(QMainWindow):
     def on_build_finished(self, result: BuildResult) -> None:
         self._log("Scan complete: %d tracked file(s), %d dependency edge(s)", len(result.bundle["files"]), len(result.bundle["dependency_graph"]))
         self.workspace = result.workspace
+        for record in self.workspace.files.values():
+            decision = self._pending_image_inclusion.pop(record.absolute_path, None)
+            if decision is not None and record.is_image:
+                set_record_inclusion_mode(record, "full" if decision else "excluded")
+                self.file_overrides[record.id] = record.inclusion_mode
         self._set_session_dir(self._session_dir_for_project_root(result.workspace.project_root))
         self.current_result = result
         self._sync_current_bundle()
         self._refresh_all_views()
-        self._show_bundle_summary(result)
+        if self.current_result is not None:
+            self._show_bundle_summary(self.current_result)
         self.status_label.setText("Scan complete.")
         self.statusBar().showMessage("Scan complete")
 
@@ -1550,6 +1680,9 @@ class MainWindow(QMainWindow):
         elif json_bytes is None:
             json_bytes = len(self.current_result.json_text.encode("utf-8")) if self.current_result else 0
 
+        if self.current_result is not None:
+            breakdown = self._token_breakdown(self.current_result.bundle, estimated_tokens)
+            estimated_tokens = max(estimated_tokens, sum(breakdown.values()))
         self.token_count_label.setText(f"Estimated context tokens: {estimated_tokens:,}")
         if self.current_result is None:
             self.token_bar.set_breakdown({}, 0, self._token_palette())
@@ -1602,6 +1735,20 @@ class MainWindow(QMainWindow):
                 self.tree.addTopLevelItem(item)
                 item.setExpanded(True)
             self.tree.resizeColumnToContents(0)
+            metrics = self.tree.fontMetrics()
+            maximum = self.tree.columnWidth(0)
+            iterator = QTreeWidgetItemIterator(self.tree)
+            while iterator.value() is not None:
+                item = iterator.value()
+                depth = 0
+                parent = item.parent()
+                while parent is not None:
+                    depth += 1
+                    parent = parent.parent()
+                width = metrics.horizontalAdvance(item.text(0)) + (depth + 1) * self.tree.indentation() + 72
+                maximum = max(maximum, width)
+                iterator += 1
+            self.tree.setColumnWidth(0, maximum)
         finally:
             self._refreshing_tree = False
 
@@ -1817,6 +1964,7 @@ class MainWindow(QMainWindow):
             self.flat_table.setRowCount(len(records))
             for row, record in enumerate(records):
                 self._set_table_row(row, record)
+            self.flat_table.resizeColumnToContents(1)
         finally:
             self._refreshing_table = False
 
@@ -1917,15 +2065,18 @@ class MainWindow(QMainWindow):
         self.selected_file_id = file_id
         menu = QMenu(self)
         include_full_action = menu.addAction("Include full")
-        include_truncated_action = menu.addAction("Include truncated")
+        include_hybrid_action = menu.addAction("Include hybrid outline")
+        include_outline_action = menu.addAction("Include outline only")
         exclude_action = menu.addAction("Exclude")
         menu.addSeparator()
         remove_action = menu.addAction("Remove selected")
         chosen_action = menu.exec(global_position)
         if chosen_action == include_full_action:
             self.include_full_selected()
-        elif chosen_action == include_truncated_action:
-            self.include_truncated_selected()
+        elif chosen_action == include_hybrid_action:
+            self.include_hybrid_selected()
+        elif chosen_action == include_outline_action:
+            self.include_outline_selected()
         elif chosen_action == exclude_action:
             self.exclude_selected()
         elif chosen_action == remove_action:
@@ -1936,11 +2087,18 @@ class MainWindow(QMainWindow):
             return
         record = self.workspace.files[file_id]
         self.selected_file_id = file_id
-        preview_text = record.content or ""
-        if not record.included:
-            preview_text = preview_text or "[excluded from prompt]"
-        elif record.inclusion_mode == "truncated":
-            preview_text = preview_text[: min(len(preview_text), self.truncation_spin.value())]
+        if record.is_image:
+            preview_text = (
+                f"Image file: {record.repo_relative_path}\n"
+                f"Media type: {record.media_type}\n"
+                f"Size: {self._format_size(record.size_bytes)}\n"
+                f"Included as base64: {'yes' if record.included else 'no'}"
+            )
+        else:
+            preview_text = render_record_content(record) or ""
+            if not record.included:
+                preview_text = record.content or "[excluded from prompt]"
+        self.preview_highlighter.set_filename(record.filename)
         self.preview.setPlainText(preview_text)
         detail_lines = [
             f"File: {record.repo_relative_path}",
@@ -1993,10 +2151,9 @@ class MainWindow(QMainWindow):
     def _apply_file_mode_without_refresh(self, file_id: str, mode: str) -> None:
         if self.workspace is None or file_id not in self.workspace.files:
             return
-        self.file_overrides[file_id] = mode
         record = self.workspace.files[file_id]
-        record.inclusion_mode = mode
-        record.included = mode != "excluded"
+        set_record_inclusion_mode(record, mode)
+        self.file_overrides[file_id] = record.inclusion_mode
 
     def _cascade_excluded_dependencies(self, file_id: str) -> None:
         if self.workspace is None:
@@ -2042,9 +2199,50 @@ class MainWindow(QMainWindow):
         self._refresh_all_views()
         self._mark_session_dirty()
 
+    def _image_paths_in_inputs(self, paths: list[str]) -> list[Path]:
+        image_paths: list[Path] = []
+        for path_text in paths:
+            path = Path(path_text).expanduser().resolve()
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
+                image_paths.append(path)
+            elif path.is_dir():
+                image_paths.extend(
+                    child.resolve()
+                    for child in path.rglob("*")
+                    if child.is_file() and child.suffix.lower() in IMAGE_EXTENSIONS
+                )
+        return list(dict.fromkeys(image_paths))
+
+    def _confirm_image_inclusion(self, paths: list[str]) -> bool:
+        image_paths = self._image_paths_in_inputs(paths)
+        if not image_paths:
+            return True
+        answer = QMessageBox.question(
+            self,
+            "Include image content?",
+            (
+                f"{len(image_paths)} image file(s) were found. Include their binary content "
+                "as base64 in the JSON bundle?\n\n"
+                "Images can make the prompt substantially larger. You can include or exclude "
+                "them later using the normal file checkboxes."
+            ),
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No
+            | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.No,
+        )
+        if answer == QMessageBox.StandardButton.Cancel:
+            return False
+        include = answer == QMessageBox.StandardButton.Yes
+        for image_path in image_paths:
+            self._pending_image_inclusion[image_path.as_posix()] = include
+        return True
+
     def add_files(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(self, "Add files")
         if not paths:
+            return
+        if not self._confirm_image_inclusion(paths):
             return
         self._log("Adding %d file(s)", len(paths))
         self._extend_input_paths(paths)
@@ -2052,6 +2250,8 @@ class MainWindow(QMainWindow):
     def add_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Add folder")
         if not folder:
+            return
+        if not self._confirm_image_inclusion([folder]):
             return
         self._log("Adding folder %s", folder)
         self._extend_input_paths([folder])
@@ -2090,9 +2290,8 @@ class MainWindow(QMainWindow):
                 self.file_overrides.pop(file_id, None)
                 removed_input_path = True
             else:
-                self.file_overrides[file_id] = "excluded"
-                record.included = False
-                record.inclusion_mode = "excluded"
+                set_record_inclusion_mode(record, "excluded")
+                self.file_overrides[file_id] = record.inclusion_mode
 
         if not removed_any:
             return
@@ -2113,9 +2312,16 @@ class MainWindow(QMainWindow):
         for file_id in self._selected_file_ids():
             self._set_file_mode(file_id, "full")
 
-    def include_truncated_selected(self) -> None:
+    def include_hybrid_selected(self) -> None:
         for file_id in self._selected_file_ids():
-            self._set_file_mode(file_id, "truncated")
+            self._set_file_mode(file_id, "hybrid")
+
+    def include_outline_selected(self) -> None:
+        for file_id in self._selected_file_ids():
+            self._set_file_mode(file_id, "outline")
+
+    def include_truncated_selected(self) -> None:
+        self.include_hybrid_selected()
 
     def exclude_selected(self) -> None:
         for file_id in self._selected_file_ids():
@@ -2263,7 +2469,7 @@ class MainWindow(QMainWindow):
                 elif action == "import":
                     input_paths.append(session_path.as_posix())
 
-        if input_paths:
+        if input_paths and self._confirm_image_inclusion(input_paths):
             self._log("Dropped %d path(s) into the app", len(input_paths))
             self._extend_input_paths(input_paths)
 
@@ -2339,6 +2545,16 @@ class MainWindow(QMainWindow):
         message = (result.stderr or result.stdout or "").strip()
         return message or f"Command exited with code {result.returncode}."
 
+    def _ask_apply_patch(self, title: str, text: str) -> bool:
+        message_box = QMessageBox(self)
+        message_box.setWindowTitle(title)
+        message_box.setText(text)
+        yes_button = message_box.addButton("✓ Yes, apply patch", QMessageBox.ButtonRole.AcceptRole)
+        message_box.addButton("No", QMessageBox.ButtonRole.RejectRole)
+        message_box.setDefaultButton(yes_button)
+        message_box.exec()
+        return message_box.clickedButton() == yes_button
+
     def _handle_patch_drop(self, patch_path: Path) -> None:
         if self.workspace is None:
             QMessageBox.information(
@@ -2355,13 +2571,10 @@ class MainWindow(QMainWindow):
         project_root = Path(self.workspace.project_root)
         current_check = self._run_git_apply(["--check", str(patch_path)], project_root)
         if current_check.returncode == 0:
-            answer = QMessageBox.question(
-                self,
+            if self._ask_apply_patch(
                 "Patch applies cleanly",
                 "This patch can be applied to the current workspace. Apply it now?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            )
-            if answer == QMessageBox.StandardButton.Yes:
+            ):
                 self._apply_patch_to_workspace(patch_path)
             else:
                 self.status_label.setText("Patch check passed.")
@@ -2370,8 +2583,7 @@ class MainWindow(QMainWindow):
 
         snapshot_ok, snapshot_error = self._check_patch_against_loaded_snapshot(patch_path)
         if snapshot_ok:
-            answer = QMessageBox.question(
-                self,
+            if self._ask_apply_patch(
                 "Patch matches loaded file state",
                 (
                     "This patch does not apply to the current workspace, but it does apply "
@@ -2379,9 +2591,7 @@ class MainWindow(QMainWindow):
                     "That usually means the workspace files changed after the prompt was created.\n\n"
                     "Overwrite the loaded workspace files with their older loaded state and then apply the patch?"
                 ),
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            )
-            if answer == QMessageBox.StandardButton.Yes:
+            ):
                 self._restore_loaded_files_to_workspace()
                 self._apply_patch_to_workspace(patch_path)
             else:

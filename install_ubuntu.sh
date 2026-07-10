@@ -4,11 +4,14 @@ set -euo pipefail
 APP_NAME="Prompt Builder"
 APP_ID="prompt-builder"
 REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+INSTALL_USER="${SUDO_USER:-$(id -un)}"
+TARGET_HOME="$(getent passwd "$INSTALL_USER" | cut -d: -f6)"
+[[ -n "$TARGET_HOME" ]] || TARGET_HOME="$HOME"
 MAIN_FILE="$REPO_DIR/main.py"
 LOGO_FILE="$REPO_DIR/prompt_builder/logo.png"
 FALLBACK_LOGO_FILE="$REPO_DIR/logo.png"
-BIN_DIR="${HOME}/.local/bin"
-XDG_DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}"
+BIN_DIR="$TARGET_HOME/.local/bin"
+XDG_DATA_DIR="$TARGET_HOME/.local/share"
 APPLICATIONS_DIR="$XDG_DATA_DIR/applications"
 ICON_THEME_DIR="$XDG_DATA_DIR/icons/hicolor"
 ICON_DIR="$ICON_THEME_DIR/256x256/apps"
@@ -44,7 +47,7 @@ find_desktop_dir() {
         return
     fi
 
-    printf '%s\n' "$HOME/Desktop"
+    printf '%s\n' "$TARGET_HOME/Desktop"
 }
 
 write_desktop_entry() {

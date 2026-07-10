@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Callable, Iterable, Iterator, Mapping
+from typing import Any, Callable, Iterable, Iterator, Mapping
 import ast
+import base64
 import hashlib
 import json
 import os
@@ -15,6 +16,13 @@ SCHEMA_VERSION = 1
 DEFAULT_MAX_DEPENDENCY_DEPTH = 5
 DEFAULT_LARGE_FILE_THRESHOLD = 256 * 1024
 DEFAULT_TRUNCATION_SIZE = 40 * 1024
+DEFAULT_SMALL_FUNCTION_MAX_LINES = 8
+MAX_OUTLINE_VALUE_CHARS = 160
+MAX_JSON_STRUCTURE_DEPTH = 6
+MAX_JSON_OBJECT_KEYS = 80
+MAX_JSON_SEQUENCE_ITEMS = 2
+REPRESENTATION_MODES = {"outline", "hybrid"}
+INCLUSION_MODES = {"full", "outline", "hybrid", "excluded"}
 
 IGNORED_DIR_NAMES = {
     ".git",
@@ -24,7 +32,6 @@ IGNORED_DIR_NAMES = {
     "venv",
     "env",
     ".env",
-    "__pycache__",
     ".mypy_cache",
     ".pytest_cache",
     ".ruff_cache",
@@ -44,23 +51,44 @@ IGNORED_DIR_NAMES = {
     "temp",
 }
 
-APPROVED_TEXT_EXTENSIONS = {
-    ".py",
-    ".pyi",
-    ".toml",
-    ".yaml",
-    ".yml",
-    ".json",
-    ".md",
-    ".txt",
-    ".rst",
-    ".ini",
-    ".cfg",
-    ".env",
-    ".example",
-    ".sample",
-    ".gitignore",
-    ".dockerignore",
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+IMAGE_MEDIA_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".bmp": "image/bmp",
+}
+
+CONTENT_BLACKLIST_FILENAMES = {
+    "uv.lock",
+    "poetry.lock",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+}
+CONTENT_BLACKLIST_EXTENSIONS = {
+    ".pyc",
+    ".pyo",
+    ".class",
+    ".o",
+    ".obj",
+    ".so",
+    ".dll",
+    ".dylib",
+    ".a",
+    ".lib",
+    ".exe",
+    ".bin",
+    ".db",
+    ".sqlite",
+    ".sqlite3",
+    ".zip",
+    ".tar",
+    ".gz",
+    ".7z",
+    ".rar",
 }
 
 PROJECT_MARKERS = {
@@ -176,6 +204,10 @@ class FileRecord:
     is_binary: bool = False
     is_large: bool = False
     is_dependency: bool = False
+    is_image: bool = False
+    media_type: str = ""
+    metadata_only: bool = False
+    raw_content: bytes | None = field(default=None, repr=False)
     module_name: str = ""
     dependency_target_ids: list[str] = field(default_factory=list)
     skipped_dependencies: list[dict] = field(default_factory=list)
@@ -256,6 +288,7 @@ class Workspace:
                 record.source_kind == "direct_file"
                 or record.is_dependency
                 or record.included
+                or record.metadata_only
                 or (self.settings.include_unchecked_folder_files and record.source_kind == "folder_file")
             )
             if keep_in_files:
@@ -422,7 +455,23 @@ def validate_bundle(bundle: dict) -> None:
     json.dumps(bundle, ensure_ascii=False)
 
 
+def render_record_content(record: FileRecord) -> str | None:
+    """Return the exact content representation that will be serialized for a file."""
+    return _render_content(record)
+
+
+def set_record_inclusion_mode(record: FileRecord, mode: str) -> None:
+    """Apply a UI/session inclusion mode to a file record."""
+    _apply_inclusion_mode(record, mode)
+
+
 def _file_record_to_json(record: FileRecord) -> dict:
+    if record.metadata_only:
+        return {
+            "filename": record.filename,
+            "repo_relative_path": record.repo_relative_path,
+        }
+
     rendered_content = _render_content(record)
     result = {
         "id": record.id,
@@ -431,6 +480,9 @@ def _file_record_to_json(record: FileRecord) -> dict:
         "included": record.included,
         "content": rendered_content,
     }
+    if record.is_image:
+        result["content_encoding"] = "base64"
+        result["media_type"] = record.media_type
     if record.truncation is not None:
         result["truncation"] = dict(record.truncation)
     return result
@@ -494,19 +546,50 @@ def _clone_tree_nodes(nodes: Iterable[TreeNode]) -> list[TreeNode]:
 
 
 def _apply_inclusion_mode(record: FileRecord, mode: str) -> None:
-    mode = mode.lower().strip()
-    if mode not in {"full", "truncated", "excluded"}:
-        mode = "full" if mode in {"include", "included", "true", "1"} else "excluded"
-    record.inclusion_mode = mode
-    record.included = mode != "excluded"
-    if mode == "truncated" and record.content is not None and record.truncation is None:
-        limit = min(DEFAULT_TRUNCATION_SIZE, len(record.content.encode("utf-8")))
-        record.truncation = {
-            "mode": "truncated",
-            "original_bytes": record.size_bytes,
-            "kept_bytes": limit,
-            "limit_bytes": DEFAULT_TRUNCATION_SIZE,
-        }
+    normalized = _normalize_inclusion_mode(mode)
+    record.inclusion_mode = normalized
+    record.included = normalized != "excluded"
+    if normalized in REPRESENTATION_MODES and record.content is not None:
+        record.truncation = _make_truncation_metadata(
+            mode=normalized,
+            original_bytes=record.size_bytes,
+            limit_bytes=DEFAULT_TRUNCATION_SIZE,
+        )
+    elif normalized == "full":
+        record.truncation = None
+
+
+def _normalize_inclusion_mode(mode: str) -> str:
+    normalized = mode.lower().strip()
+    if normalized == "truncated":
+        return "hybrid"
+    if normalized in INCLUSION_MODES:
+        return normalized
+    if normalized in {"include", "included", "true", "1", "yes"}:
+        return "full"
+    if normalized in {"summary", "summarized", "compact", "smart", "adaptive"}:
+        return "hybrid"
+    return "excluded"
+
+
+def _make_truncation_metadata(
+    mode: str,
+    original_bytes: int,
+    limit_bytes: int,
+    *,
+    rendered_bytes: int | None = None,
+    strategy: str = "adaptive",
+) -> dict:
+    metadata = {
+        "mode": mode,
+        "strategy": strategy,
+        "original_bytes": original_bytes,
+        "limit_bytes": limit_bytes,
+    }
+    if rendered_bytes is not None:
+        metadata["rendered_bytes"] = rendered_bytes
+        metadata["kept_bytes"] = rendered_bytes
+    return metadata
 
 
 def _check_cancel(should_cancel: CancelCallback | None) -> None:
@@ -763,11 +846,27 @@ def _ensure_record(
         node = _make_tree_node(existing, reused=True)
         return existing, node
 
-    loaded = _read_file(path, settings.large_file_threshold, settings.truncation_size)
-    if loaded is None:
-        return None, TreeNode(label=path.name, kind="skipped", file_id=None, repo_relative_path=_relative_path(path, project_root), absolute_path=_path_to_json(path), skipped_reason="unreadable or binary")
+    metadata_only = _is_metadata_only_candidate(path)
+    if metadata_only:
+        try:
+            size_bytes = path.stat().st_size
+        except OSError:
+            size_bytes = 0
+        content = None
+        raw_bytes = b""
+        is_binary = True
+        is_large = False
+        truncation = None
+        unreadable_reason = "content omitted by blacklist"
+        syntax_error = None
+    else:
+        loaded = _read_file(path, settings.large_file_threshold, settings.truncation_size)
+        if loaded is None:
+            return None, TreeNode(label=path.name, kind="skipped", file_id=None, repo_relative_path=_relative_path(path, project_root), absolute_path=_path_to_json(path), skipped_reason="unreadable")
+        content, raw_bytes, is_binary, is_large, truncation, unreadable_reason, syntax_error = loaded
+        size_bytes = len(raw_bytes)
 
-    content, raw_bytes, is_binary, is_large, truncation, unreadable_reason, syntax_error = loaded
+    is_image = _is_image_file(path)
     repo_relative_path = _relative_path(path, project_root)
     file_id = repo_relative_path
     included, inclusion_mode = _default_inclusion_state(context_type, is_large, is_binary, is_dependency)
@@ -783,7 +882,7 @@ def _ensure_record(
         source_kind=source_kind,
         origin_kinds=list(dict.fromkeys(origin_kinds)),
         parent_ids=list(dict.fromkeys(parent_ids)),
-        size_bytes=len(raw_bytes),
+        size_bytes=size_bytes,
         line_count=_line_count(content),
         content_hash=hashlib.sha256(raw_bytes).hexdigest(),
         content=content,
@@ -793,6 +892,10 @@ def _ensure_record(
         is_binary=is_binary,
         is_large=is_large,
         is_dependency=is_dependency,
+        is_image=is_image,
+        media_type=IMAGE_MEDIA_TYPES.get(path.suffix.lower(), "application/octet-stream") if is_image else "",
+        metadata_only=metadata_only,
+        raw_content=raw_bytes if is_image else None,
         module_name=module_name,
     )
     if is_binary and unreadable_reason is None:
@@ -1162,7 +1265,7 @@ def _iter_folder_files(folder: Path, include_hidden: bool) -> Iterator[Path]:
             path = root_path / name
             if _ignored_path(path, include_hidden):
                 continue
-            if _is_text_candidate(path):
+            if _is_file_candidate(path):
                 yield path.resolve()
 
 
@@ -1177,11 +1280,19 @@ def _ignored_path(path: Path, include_hidden: bool) -> bool:
     return any(part in IGNORED_DIR_NAMES for part in path.parts)
 
 
-def _is_text_candidate(path: Path) -> bool:
-    if path.name in {"README", "README.md", "LICENSE", "LICENSE.txt"}:
-        return True
-    suffix = path.suffix.lower()
-    return suffix in APPROVED_TEXT_EXTENSIONS or path.name.endswith(".env.example") or path.name.endswith(".env.sample")
+def _is_file_candidate(path: Path) -> bool:
+    return path.is_file()
+
+
+def _is_image_file(path: Path) -> bool:
+    return path.suffix.lower() in IMAGE_EXTENSIONS
+
+
+def _is_metadata_only_candidate(path: Path) -> bool:
+    return (
+        path.name.lower() in CONTENT_BLACKLIST_FILENAMES
+        or path.suffix.lower() in CONTENT_BLACKLIST_EXTENSIONS
+    )
 
 
 def _is_python_file(path: Path) -> bool:
@@ -1203,12 +1314,11 @@ def _read_file(path: Path, large_threshold: int, truncation_size: int) -> tuple[
     is_large = len(raw) > large_threshold
     truncation = None
     if is_large:
-        truncation = {
-            "mode": "truncated",
-            "original_bytes": len(raw),
-            "kept_bytes": len(text[:truncation_size].encode("utf-8")),
-            "limit_bytes": truncation_size,
-        }
+        truncation = _make_truncation_metadata(
+            mode="hybrid",
+            original_bytes=len(raw),
+            limit_bytes=truncation_size,
+        )
     return text, raw, False, is_large, truncation, None, None
 
 
@@ -1216,7 +1326,7 @@ def _default_inclusion_state(context_type: str, is_large: bool, is_binary: bool,
     if is_binary:
         return False, "excluded"
     if is_large:
-        return False, "excluded"
+        return True, "hybrid"
     if is_dependency:
         return True, "full"
     return True, "full"
@@ -1243,15 +1353,343 @@ def _make_tree_node(record: FileRecord, reused: bool) -> TreeNode:
 def _render_content(record: FileRecord) -> str | None:
     if not record.included:
         return None
+    if record.is_image:
+        if record.raw_content is None:
+            return None
+        return base64.b64encode(record.raw_content).decode("ascii")
     if record.content is None:
         return None
-    if record.inclusion_mode == "truncated":
+
+    mode = _normalize_inclusion_mode(record.inclusion_mode)
+    if mode in REPRESENTATION_MODES:
         limit = DEFAULT_TRUNCATION_SIZE
         if record.truncation and isinstance(record.truncation.get("limit_bytes"), int):
             limit = int(record.truncation["limit_bytes"])
-        if limit > 0:
-            return record.content[:limit]
+        rendered, strategy = _render_adaptive_representation(record, mode, limit)
+        record.inclusion_mode = mode
+        record.truncation = _make_truncation_metadata(
+            mode=mode,
+            original_bytes=record.size_bytes,
+            limit_bytes=limit,
+            rendered_bytes=len(rendered.encode("utf-8")),
+            strategy=strategy,
+        )
+        return rendered
+
     return record.content
+
+
+def _render_adaptive_representation(record: FileRecord, mode: str, limit: int) -> tuple[str, str]:
+    path = Path(record.absolute_path)
+    suffix = path.suffix.lower()
+    if suffix in {".py", ".pyi"}:
+        return _render_python_representation(record, mode), f"python_{mode}_ast"
+    if suffix in {".md", ".mdx", ".rst"}:
+        return _render_markdown_outline(record, limit), "markdown_headings"
+    if suffix == ".json":
+        return _render_json_structure(record, limit), "json_structure"
+    if suffix in {".yaml", ".yml"}:
+        return _render_yaml_key_outline(record, limit), "yaml_keys"
+    return _render_byte_limited_text(record.content or "", limit), "byte_truncate"
+
+
+def _representation_header(record: FileRecord, mode: str, strategy: str) -> list[str]:
+    return [
+        f"# {mode.title()} representation generated because this file is large or was requested in compact mode.",
+        "# Implementation bodies are omitted except for small functions in hybrid mode.",
+        f"# Strategy: {strategy}",
+        f"# Source: {record.repo_relative_path}",
+        f"# Original bytes: {record.size_bytes}",
+        f"# Original lines: {record.line_count}",
+        "",
+    ]
+
+
+def _render_python_representation(record: FileRecord, mode: str) -> str:
+    source = record.content or ""
+    try:
+        tree = ast.parse(source, filename=record.absolute_path)
+    except SyntaxError as exc:
+        header = _representation_header(record, mode, "python_ast_failed")
+        header.extend(
+            [
+                f"# SyntaxError while generating outline: {exc}",
+                "# Falling back to byte-limited content.",
+                "",
+                _render_byte_limited_text(source, DEFAULT_TRUNCATION_SIZE),
+            ]
+        )
+        return "\n".join(header).rstrip() + "\n"
+
+    lines = _representation_header(record, mode, f"python_{mode}_ast")
+    module_docstring = ast.get_docstring(tree)
+    if module_docstring:
+        lines.extend(["# Module docstring", *_render_docstring_lines(module_docstring), ""])
+
+    imports = [_safe_unparse(node) for node in tree.body if isinstance(node, (ast.Import, ast.ImportFrom))]
+    if imports:
+        lines.append("# Imports")
+        lines.extend(imports)
+        lines.append("")
+
+    constants = [
+        rendered
+        for node in tree.body
+        if isinstance(node, (ast.Assign, ast.AnnAssign))
+        for rendered in [_render_assignment_outline(node)]
+        if rendered
+    ]
+    if constants:
+        lines.append("# Module constants and top-level assignments")
+        lines.extend(constants)
+        lines.append("")
+
+    public_symbols = [
+        node
+        for node in tree.body
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+        and not node.name.startswith("_")
+    ]
+    internal_symbols = [
+        node
+        for node in tree.body
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name.startswith("_")
+    ]
+
+    if public_symbols:
+        lines.extend(["# Public API", ""])
+        lines.extend(_render_python_symbols(public_symbols, source, mode))
+    if internal_symbols:
+        lines.extend(["# Internal helpers", ""])
+        lines.extend(_render_python_symbols(internal_symbols, source, mode))
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _render_python_symbols(nodes: list[ast.AST], source: str, mode: str) -> list[str]:
+    lines: list[str] = []
+    for node in nodes:
+        if isinstance(node, ast.ClassDef):
+            lines.extend(_render_class_outline(node, source, mode))
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            lines.extend(_render_function_outline(node, source, mode, indent=""))
+        lines.append("")
+    return lines
+
+
+def _render_class_outline(node: ast.ClassDef, source: str, mode: str) -> list[str]:
+    lines: list[str] = []
+    bases = [_safe_unparse(base) for base in node.bases]
+    base_text = f"({', '.join(bases)})" if bases else ""
+    lines.append(f"# Lines: {node.lineno}-{getattr(node, 'end_lineno', node.lineno)}")
+    if bases:
+        lines.append(f"# Bases: {', '.join(bases)}")
+    for decorator in node.decorator_list:
+        lines.append(f"@{_safe_unparse(decorator)}")
+    lines.append(f"class {node.name}{base_text}:")
+
+    docstring = ast.get_docstring(node)
+    body_lines: list[str] = []
+    if docstring:
+        body_lines.extend(_render_docstring_lines(docstring, indent="    "))
+
+    fields = [_render_assignment_outline(child, indent="    ") for child in node.body if isinstance(child, (ast.Assign, ast.AnnAssign))]
+    fields = [field for field in fields if field]
+    if fields:
+        body_lines.append("    # Fields")
+        body_lines.extend(fields)
+
+    nested_classes = [child for child in node.body if isinstance(child, ast.ClassDef)]
+    methods = [child for child in node.body if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    if methods:
+        body_lines.append("    # Methods")
+        for method in methods:
+            body_lines.extend(_render_function_outline(method, source, mode, indent="    "))
+            body_lines.append("")
+    if nested_classes:
+        body_lines.append("    # Nested classes")
+        for nested in nested_classes:
+            body_lines.extend(_indent_lines(_render_class_outline(nested, source, mode), "    "))
+            body_lines.append("")
+
+    if not body_lines:
+        body_lines.append("    ...")
+    while body_lines and body_lines[-1] == "":
+        body_lines.pop()
+    lines.extend(body_lines)
+    return lines
+
+
+def _render_function_outline(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+    source: str,
+    mode: str,
+    *,
+    indent: str,
+) -> list[str]:
+    if mode == "hybrid" and _is_small_function(node):
+        source_segment = ast.get_source_segment(source, node)
+        if source_segment:
+            return _indent_lines(_dedent_ast_source_segment(source_segment, node.col_offset), indent)
+
+    lines: list[str] = []
+    lines.append(f"{indent}# Lines: {node.lineno}-{getattr(node, 'end_lineno', node.lineno)}")
+    for decorator in node.decorator_list:
+        lines.append(f"{indent}@{_safe_unparse(decorator)}")
+    lines.append(f"{indent}{_function_header(node)}")
+    docstring = ast.get_docstring(node)
+    if docstring:
+        lines.extend(_render_docstring_lines(docstring, indent=f"{indent}    "))
+    lines.append(f"{indent}    ...")
+    return lines
+
+
+def _function_header(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
+    prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
+    args = _safe_unparse(node.args)
+    returns = f" -> {_safe_unparse(node.returns)}" if node.returns is not None else ""
+    return f"{prefix} {node.name}({args}){returns}:"
+
+
+def _is_small_function(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    end_lineno = getattr(node, "end_lineno", node.lineno)
+    line_span = max(1, end_lineno - node.lineno + 1)
+    if line_span > DEFAULT_SMALL_FUNCTION_MAX_LINES:
+        return False
+    return not any(isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) for child in ast.walk(node) if child is not node)
+
+
+def _dedent_ast_source_segment(segment: str, col_offset: int) -> list[str]:
+    lines = segment.rstrip().splitlines()
+    if col_offset <= 0:
+        return lines
+    prefix = " " * col_offset
+    return [line[col_offset:] if line.startswith(prefix) else line for line in lines]
+
+
+def _render_docstring_lines(docstring: str, indent: str = "") -> list[str]:
+    stripped = docstring.strip()
+    if not stripped:
+        return []
+    escaped = stripped.replace('"""', '\"\"\"')
+    if "\n" not in escaped:
+        return [f'{indent}"""{escaped}"""']
+    return [f'{indent}"""', *[f"{indent}{line}" for line in escaped.splitlines()], f'{indent}"""']
+
+
+def _render_assignment_outline(node: ast.Assign | ast.AnnAssign, indent: str = "") -> str:
+    if isinstance(node, ast.AnnAssign):
+        target = _safe_unparse(node.target)
+        annotation = _safe_unparse(node.annotation)
+        if node.value is None:
+            return f"{indent}{target}: {annotation}"
+        return f"{indent}{target}: {annotation} = {_summarize_ast_value(node.value)}"
+
+    targets = [_safe_unparse(target) for target in node.targets]
+    if not targets:
+        return ""
+    return f"{indent}{' = '.join(targets)} = {_summarize_ast_value(node.value)}"
+
+
+def _summarize_ast_value(value: ast.AST) -> str:
+    if isinstance(value, ast.Dict):
+        keys = []
+        for key in value.keys[:8]:
+            keys.append(_safe_unparse(key) if key is not None else "**")
+        suffix = ", ..." if len(value.keys) > 8 else ""
+        return "{" + ", ".join(f"{key}: ..." for key in keys) + suffix + "}"
+    if isinstance(value, (ast.List, ast.Tuple, ast.Set)):
+        open_char, close_char = ("[", "]") if isinstance(value, ast.List) else ("(", ")") if isinstance(value, ast.Tuple) else ("{", "}")
+        elements = [_safe_unparse(element) for element in value.elts[:8]]
+        suffix = ", ..." if len(value.elts) > 8 else ""
+        return open_char + ", ".join(elements) + suffix + close_char
+    rendered = _safe_unparse(value)
+    rendered = " ".join(rendered.split())
+    if len(rendered) > MAX_OUTLINE_VALUE_CHARS:
+        return rendered[: MAX_OUTLINE_VALUE_CHARS - 3].rstrip() + "..."
+    return rendered
+
+
+def _indent_lines(lines: list[str], indent: str) -> list[str]:
+    if not indent:
+        return lines
+    return [f"{indent}{line}" if line else "" for line in lines]
+
+
+def _render_markdown_outline(record: FileRecord, limit: int) -> str:
+    heading_pattern = re.compile(r"^\s{0,3}(#{1,6})\s+(.+?)\s*$")
+    lines = _representation_header(record, "outline", "markdown_headings")
+    headings = []
+    for line_number, line in enumerate((record.content or "").splitlines(), start=1):
+        match = heading_pattern.match(line)
+        if match:
+            headings.append(f"{match.group(1)} {match.group(2)}  <!-- line {line_number} -->")
+    lines.extend(headings or ["# No markdown headings found."])
+    return _render_byte_limited_text("\n".join(lines).rstrip() + "\n", limit)
+
+
+def _render_json_structure(record: FileRecord, limit: int) -> str:
+    lines = _representation_header(record, "outline", "json_structure")
+    try:
+        payload = json.loads(record.content or "")
+    except json.JSONDecodeError as exc:
+        lines.extend([f"# JSONDecodeError while generating structure: {exc}", "", _render_byte_limited_text(record.content or "", limit)])
+        return "\n".join(lines).rstrip() + "\n"
+    skeleton = _json_skeleton(payload)
+    lines.append(json.dumps(skeleton, indent=2, ensure_ascii=False))
+    return _render_byte_limited_text("\n".join(lines).rstrip() + "\n", limit)
+
+
+def _json_skeleton(value: Any, depth: int = 0) -> Any:
+    if depth >= MAX_JSON_STRUCTURE_DEPTH:
+        return "<max depth omitted>"
+    if isinstance(value, dict):
+        output: dict[str, Any] = {}
+        items = list(value.items())
+        for key, child in items[:MAX_JSON_OBJECT_KEYS]:
+            output[str(key)] = _json_skeleton(child, depth + 1)
+        if len(items) > MAX_JSON_OBJECT_KEYS:
+            output["..."] = f"{len(items) - MAX_JSON_OBJECT_KEYS} more keys omitted"
+        return output
+    if isinstance(value, list):
+        rendered_items = [_json_skeleton(item, depth + 1) for item in value[:MAX_JSON_SEQUENCE_ITEMS]]
+        if len(value) > MAX_JSON_SEQUENCE_ITEMS:
+            rendered_items.append(f"... {len(value) - MAX_JSON_SEQUENCE_ITEMS} more items omitted")
+        return rendered_items
+    return f"<{type(value).__name__}>"
+
+
+def _render_yaml_key_outline(record: FileRecord, limit: int) -> str:
+    lines = _representation_header(record, "outline", "yaml_keys")
+    key_pattern = re.compile(r"^(?P<indent>\s*)(?:-\s*)?(?P<key>[^:#][^:]*):(?:\s*(?P<value>.*))?$")
+    found = False
+    for line_number, line in enumerate((record.content or "").splitlines(), start=1):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        match = key_pattern.match(line)
+        if not match:
+            continue
+        found = True
+        indent = match.group("indent")
+        key = match.group("key").strip()
+        value = (match.group("value") or "").strip()
+        suffix = " ..." if value else ""
+        lines.append(f"{indent}{key}:{suffix}  # line {line_number}")
+    if not found:
+        lines.append("# No YAML mapping keys found.")
+    return _render_byte_limited_text("\n".join(lines).rstrip() + "\n", limit)
+
+
+def _render_byte_limited_text(text: str, limit: int) -> str:
+    if limit <= 0:
+        return ""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= limit:
+        return text
+    clipped = encoded[:limit].decode("utf-8", errors="ignore").rstrip()
+    return f"{clipped}\n\n# ... content omitted after {limit} bytes ...\n"
+
 
 
 def _line_count(text: str | None) -> int:
