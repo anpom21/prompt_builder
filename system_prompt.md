@@ -82,6 +82,7 @@ Code-change output requirements:
 * Include new files, deleted files, and modified files in the diff when relevant.
 * Do not output entire rewritten files unless a full-file replacement is genuinely necessary.
 * Keep the patch focused on the requested task.
+* Make sure that the diff is and passes `git apply --check` without errors.
 
 Your output should have the following strucure:
 ```md

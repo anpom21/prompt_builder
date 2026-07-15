@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# --------------------------------- Variables -------------------------------- #
 APP_NAME="Prompt Builder"
 APP_ID="prompt-builder"
 REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -8,7 +9,7 @@ INSTALL_USER="${SUDO_USER:-$(id -un)}"
 TARGET_HOME="$(getent passwd "$INSTALL_USER" | cut -d: -f6)"
 [[ -n "$TARGET_HOME" ]] || TARGET_HOME="$HOME"
 MAIN_FILE="$REPO_DIR/main.py"
-LOGO_FILE="$REPO_DIR/prompt_builder/logo.png"
+LOGO_FILE="$REPO_DIR/src/context_builder/logo.svg"
 FALLBACK_LOGO_FILE="$REPO_DIR/logo.png"
 BIN_DIR="$TARGET_HOME/.local/bin"
 XDG_DATA_DIR="$TARGET_HOME/.local/share"
@@ -20,6 +21,7 @@ DESKTOP_PATH="$APPLICATIONS_DIR/$APP_ID.desktop"
 INSTALLED_ICON_PATH="$ICON_DIR/$APP_ID.png"
 DESKTOP_SHORTCUT_PATH=""
 
+# --------------------------------- Functions -------------------------------- #
 fail() {
     echo "Error: $*" >&2
     exit 1
@@ -93,6 +95,10 @@ refresh_desktop_integration() {
         gio set "$DESKTOP_SHORTCUT_PATH" metadata::trusted true >/dev/null 2>&1 || true
     fi
 }
+
+# ---------------------------------------------------------------------------- #
+#                                     Main                                     #
+# ---------------------------------------------------------------------------- #
 
 if [[ ! -f "$LOGO_FILE" && -f "$FALLBACK_LOGO_FILE" ]]; then
     LOGO_FILE="$FALLBACK_LOGO_FILE"
