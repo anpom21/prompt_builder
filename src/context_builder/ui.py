@@ -214,6 +214,9 @@ class MainWindow(QMainWindow):
         self._set_application_icon()
         self.resize(1500, 950)
         self.setAcceptDrops(True)
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
         self.verbose = verbose
 
         self.input_paths: list[str] = list(dict.fromkeys(default_paths or []))
@@ -285,6 +288,7 @@ class MainWindow(QMainWindow):
         self.add_file_action = QAction("Add File...", self)
         self.add_folder_action = QAction("Add Folder...", self)
         self.refresh_action = QAction("Refresh", self)
+        self.refresh_action.setShortcut(QKeySequence("Ctrl+R"))
         self.copy_action = QAction("Copy Context", self)
         self.new_session_action = QAction("New Session", self)
         self.save_session_action = QAction("Save Session", self)
@@ -1168,15 +1172,16 @@ class MainWindow(QMainWindow):
         token_layout.addWidget(self.token_count_label)
         token_layout.addWidget(self.token_bar)
         token_layout.addWidget(self.token_breakdown_label)
-        self.cancel_button = QPushButton("Cancel")
-        self.cancel_button.clicked.connect(self.cancel_build)
+        self.refresh_button = QPushButton("Refresh")
+        self.refresh_button.setToolTip("Refresh the imported files (Ctrl+R)")
+        self.refresh_button.clicked.connect(self.request_rebuild)
         self.save_state_label = QLabel("Saved")
         self.save_state_label.setObjectName("saveStateLabel")
         self.save_state_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         footer.addWidget(self.status_label, 1)
         footer.addWidget(self.save_state_label, 1)
         footer.addLayout(token_layout, 4)
-        footer.addWidget(self.cancel_button)
+        footer.addWidget(self.refresh_button)
         root_layout.addWidget(footer_card)
 
         self.add_file_action.triggered.connect(lambda: self.add_files())
@@ -1494,6 +1499,8 @@ class MainWindow(QMainWindow):
             self.flat_table,
         ]:
             widget.setEnabled(enabled)
+        self.refresh_button.setEnabled(True)
+
         for attribute in [
             "new_session_button",
             "save_session_button",
@@ -1523,9 +1530,45 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Cancelling...")
             self.statusBar().showMessage("Cancelling scan...")
 
+    def _paste_clipboard_image(self) -> bool:
+        clipboard = QApplication.clipboard()
+        mime_data = clipboard.mimeData()
+        if mime_data is None or not mime_data.hasImage():
+            return False
+
+        image = clipboard.image()
+        if image.isNull():
+            return False
+
+        pasted_dir = self._session_dir / "pasted-images"
+        pasted_dir.mkdir(parents=True, exist_ok=True)
+        index = 1
+        while True:
+            target = pasted_dir / f"Pasted image {index}.png"
+            if not target.exists():
+                break
+            index += 1
+
+        if not image.save(str(target), "PNG"):
+            QMessageBox.warning(self, "Paste failed", "The clipboard image could not be saved.")
+            return True
+
+        self._pending_image_inclusion[target.resolve().as_posix()] = True
+        self._extend_input_paths([target.as_posix()])
+        self.status_label.setText(f"Pasted {target.name}.")
+        self.statusBar().showMessage(f"Pasted clipboard image as {target.name}")
+        return True
+
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # type: ignore[override]
         if event.type() == QEvent.Type.KeyPress:
             key_event = event if isinstance(event, QKeyEvent) else None
+            if (
+                key_event is not None
+                and key_event.matches(QKeySequence.StandardKey.Paste)
+                and self._paste_clipboard_image()
+            ):
+                event.accept()
+                return True
             if watched in {self.tree, self.flat_table}:
                 if key_event is not None and key_event.key() == Qt.Key_Delete:
                     self.remove_selected()
@@ -1933,10 +1976,23 @@ class MainWindow(QMainWindow):
         return self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon)
 
 
-    def _style_item(self, item: QTreeWidgetItem, record) -> None:
-        if record.is_dependency:
-            from PySide6.QtGui import QBrush, QColor
+    def _record_needs_attention(self, record) -> bool:
+        if self.workspace is None:
+            return False
+        try:
+            Path(record.absolute_path).resolve().relative_to(self.workspace.project_root.resolve())
+            outside_workspace = False
+        except ValueError:
+            outside_workspace = True
+        return outside_workspace or record.metadata_only or (record.is_binary and not record.is_image)
 
+    def _style_item(self, item: QTreeWidgetItem, record) -> None:
+        from PySide6.QtGui import QBrush, QColor
+
+        if self._record_needs_attention(record):
+            for col in range(item.columnCount()):
+                item.setForeground(col, QBrush(QColor("#fbbf24")))
+        elif record.is_dependency:
             for col in range(item.columnCount()):
                 item.setForeground(col, QBrush(QColor("gray")))
         if record.source_kind == "direct_file":
@@ -1983,7 +2039,9 @@ class MainWindow(QMainWindow):
                 item.setFlags((item.flags() | Qt.ItemIsUserCheckable) & ~Qt.ItemIsEditable)
             else:
                 item.setFlags(item.flags() & ~Qt.ItemIsEditable)
-            if record.is_dependency:
+            if self._record_needs_attention(record):
+                item.setForeground(QColor("#fbbf24"))
+            elif record.is_dependency:
                 item.setForeground(Qt.gray)
             self.flat_table.setItem(row, col, item)
 
@@ -2738,23 +2796,40 @@ class MainWindow(QMainWindow):
 
     def _paths_from_mime_data(self, mime_data) -> list[str]:
         paths: list[str] = []
+
+        def add_candidate(candidate: str) -> None:
+            candidate = candidate.strip().strip('"')
+            if not candidate or candidate.lower() in {"copy", "cut"}:
+                return
+            url = QUrl(candidate)
+            if candidate.startswith("file://") and url.isLocalFile():
+                paths.append(url.toLocalFile())
+            elif Path(candidate).expanduser().exists():
+                paths.append(candidate)
+
         if mime_data.hasUrls():
             for url in mime_data.urls():
                 if url.isLocalFile():
                     paths.append(url.toLocalFile())
-        if not paths and mime_data.hasText():
-            raw_text = mime_data.text().strip()
-            for line in raw_text.splitlines():
-                candidate = line.strip().strip('"')
-                if not candidate:
-                    continue
-                if candidate.startswith("file://"):
-                    url = QUrl(candidate)
-                    if url.isLocalFile():
-                        paths.append(url.toLocalFile())
-                    continue
-                paths.append(candidate)
-        return paths
+
+        for mime_type in ("text/uri-list", "x-special/gnome-copied-files"):
+            if mime_data.hasFormat(mime_type):
+                raw = bytes(mime_data.data(mime_type)).decode("utf-8", errors="replace")
+                for line in raw.splitlines():
+                    add_candidate(line)
+
+        if mime_data.hasText():
+            for line in mime_data.text().splitlines():
+                add_candidate(line)
+
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for path in paths:
+            resolved = str(Path(path).expanduser().resolve())
+            if resolved not in seen:
+                seen.add(resolved)
+                normalized.append(resolved)
+        return normalized
 
 
 def launch_app(

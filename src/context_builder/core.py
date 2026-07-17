@@ -821,7 +821,7 @@ def _ensure_record(
     is_dependency: bool,
 ) -> tuple[FileRecord | None, TreeNode | None]:
     path = path.resolve()
-    if _ignored_path(path, settings.include_hidden):
+    if source_kind != "direct_file" and _ignored_path(path, settings.include_hidden):
         return None, TreeNode(label=path.name, kind="ignored", file_id=None, repo_relative_path=_relative_path(path, project_root), absolute_path=_path_to_json(path), skipped_reason="ignored by path rules")
 
     existing = file_cache.get(path)
