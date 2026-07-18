@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# --------------------------------- Variables -------------------------------- #
-APP_NAME="Prompt Builder"
-APP_ID="prompt-builder"
+APP_NAME="Context Builder"
+APP_ID="context-builder"
 REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_USER="${SUDO_USER:-$(id -un)}"
 TARGET_HOME="$(getent passwd "$INSTALL_USER" | cut -d: -f6)"
 [[ -n "$TARGET_HOME" ]] || TARGET_HOME="$HOME"
 MAIN_FILE="$REPO_DIR/main.py"
-LOGO_FILE="$REPO_DIR/src/context_builder/logo.svg"
-FALLBACK_LOGO_FILE="$REPO_DIR/logo.png"
+LOGO_FILE="$REPO_DIR/context_builder/logo.svg"
+FALLBACK_LOGO_FILE="$REPO_DIR/src/context_builder/logo.svg"
 BIN_DIR="$TARGET_HOME/.local/bin"
 XDG_DATA_DIR="$TARGET_HOME/.local/share"
 APPLICATIONS_DIR="$XDG_DATA_DIR/applications"
@@ -18,10 +17,9 @@ ICON_THEME_DIR="$XDG_DATA_DIR/icons/hicolor"
 ICON_DIR="$ICON_THEME_DIR/256x256/apps"
 WRAPPER_PATH="$BIN_DIR/$APP_ID"
 DESKTOP_PATH="$APPLICATIONS_DIR/$APP_ID.desktop"
-INSTALLED_ICON_PATH="$ICON_DIR/$APP_ID.png"
+INSTALLED_ICON_PATH="$ICON_DIR/$APP_ID.svg"
 DESKTOP_SHORTCUT_PATH=""
 
-# --------------------------------- Functions -------------------------------- #
 fail() {
     echo "Error: $*" >&2
     exit 1
@@ -60,14 +58,14 @@ write_desktop_entry() {
 Type=Application
 Version=1.0
 Name=$APP_NAME
-GenericName=Prompt Bundle Builder
-Comment=Build repository-aware prompt bundles for LLMs
+GenericName=Context Bundle Builder
+Comment=Build repository-aware context bundles for LLMs
 Exec="$WRAPPER_PATH" %F
 Path=$REPO_DIR
 Icon=$APP_ID
 Terminal=false
 Categories=Development;Utility;
-Keywords=prompt;builder;llm;ai;context;repository;
+Keywords=context;builder;llm;ai;repository;
 StartupNotify=true
 StartupWMClass=$APP_ID
 NoDisplay=false
@@ -96,16 +94,12 @@ refresh_desktop_integration() {
     fi
 }
 
-# ---------------------------------------------------------------------------- #
-#                                     Main                                     #
-# ---------------------------------------------------------------------------- #
-
 if [[ ! -f "$LOGO_FILE" && -f "$FALLBACK_LOGO_FILE" ]]; then
     LOGO_FILE="$FALLBACK_LOGO_FILE"
 fi
 
-require_file "$MAIN_FILE" "Prompt Builder entrypoint"
-require_file "$LOGO_FILE" "Prompt Builder logo"
+require_file "$MAIN_FILE" "Context Builder entrypoint"
+require_file "$LOGO_FILE" "Context Builder logo"
 require_command python3
 
 mkdir -p "$BIN_DIR" "$APPLICATIONS_DIR" "$ICON_DIR"

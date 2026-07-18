@@ -8,3 +8,5 @@ wheels/
 
 # Virtual environments
 .venv
+**/material-icon-theme/**
+.context_sessions/**
