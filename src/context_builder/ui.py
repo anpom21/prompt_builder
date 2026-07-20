@@ -11,12 +11,24 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QObject, Qt, QThread, QTimer, Signal, QUrl, QRegularExpression
-from PySide6.QtGui import QAction, QColor, QFontDatabase, QIcon, QKeyEvent, QKeySequence, QPainter, QSyntaxHighlighter, QTextCharFormat
+from PySide6.QtCore import (
+    QEvent,
+    QItemSelectionModel,
+    QObject,
+    Qt,
+    QThread,
+    QTimer,
+    Signal,
+    QUrl,
+    QRegularExpression,
+)
+from PySide6.QtGui import QAction, QBrush, QColor, QFontDatabase, QIcon, QKeyEvent, QKeySequence, QPainter, QSyntaxHighlighter, QTextCharFormat
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QDockWidget,
     QFileDialog,
     QFormLayout,
@@ -65,6 +77,14 @@ from .core import (
     render_record_content,
     serialize_bundle,
     set_record_inclusion_mode,
+)
+from .config import opened_repositories, record_opened_repository
+from .curator import (
+    CuratorRecommendation,
+    TIER_HIGH,
+    TIER_LOW,
+    TIER_POTENTIAL,
+    rank_workspace_files,
 )
 
 logger = logging.getLogger(__name__)
@@ -202,6 +222,80 @@ class FileSyntaxHighlighter(QSyntaxHighlighter):
                 self.setFormat(match.capturedStart(), match.capturedLength(), text_format)
 
 
+class RepositorySwitcherPopup(QFrame):
+    repository_activated = Signal(str)
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setObjectName("repositorySwitcher")
+        self.setVisible(False)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(8)
+
+        heading = QLabel("Switch repository")
+        heading.setObjectName("sectionLabel")
+        self.repository_list = QListWidget()
+        self.repository_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.repository_list.itemActivated.connect(self._activate_item)
+
+        hint = QLabel("Keep Ctrl held and press Tab to cycle. Release Ctrl to switch.")
+        hint.setObjectName("hintLabel")
+        hint.setWordWrap(True)
+
+        layout.addWidget(heading)
+        layout.addWidget(self.repository_list, 1)
+        layout.addWidget(hint)
+
+    def set_repositories(self, repositories: list[Path], current: Path | None) -> None:
+        self.repository_list.clear()
+        current_path = self._resolved_path(current)
+        current_row = -1
+        for row, repository in enumerate(repositories):
+            resolved = self._resolved_path(repository)
+            item = QListWidgetItem(repository.name or repository.as_posix())
+            item.setData(Qt.UserRole, repository.as_posix())
+            item.setToolTip(repository.as_posix())
+            self.repository_list.addItem(item)
+            if current_path is not None and resolved == current_path:
+                current_row = row
+
+        if self.repository_list.count() == 0:
+            return
+        self.repository_list.setCurrentRow(current_row if current_row >= 0 else 0)
+
+    def cycle(self, step: int) -> None:
+        count = self.repository_list.count()
+        if count == 0:
+            return
+        current = self.repository_list.currentRow()
+        if current < 0:
+            current = 0
+        self.repository_list.setCurrentRow((current + step) % count)
+
+    def selected_repository(self) -> Path | None:
+        item = self.repository_list.currentItem()
+        if item is None:
+            return None
+        value = item.data(Qt.UserRole)
+        return Path(value) if isinstance(value, str) else None
+
+    def _activate_item(self, item: QListWidgetItem) -> None:
+        value = item.data(Qt.UserRole)
+        if isinstance(value, str):
+            self.repository_activated.emit(value)
+
+    @staticmethod
+    def _resolved_path(path: Path | None) -> Path | None:
+        if path is None:
+            return None
+        try:
+            return path.expanduser().resolve()
+        except OSError:
+            return path.expanduser()
+
+
 class MainWindow(QMainWindow):
     def __init__(
         self,
@@ -227,9 +321,11 @@ class MainWindow(QMainWindow):
         self._worker_thread: QThread | None = None
         self._worker: BuildWorker | None = None
         self._pending_rebuild = False
+        self._pending_repository_switch: Path | None = None
         self._pending_image_inclusion: dict[str, bool] = {}
         self._refreshing_tree = False
         self._refreshing_table = False
+        self._curator_recommendations: list[CuratorRecommendation] = []
         self._file_icon_cache: dict[str, QIcon] = {}
         self._material_icon_dir = Path(__file__).resolve().parent / "icons" / "material-icon-theme" / "icons"
         self._skill_prompts: dict[str, str] = {}
@@ -249,6 +345,10 @@ class MainWindow(QMainWindow):
         self._settings_rebuild_timer.setSingleShot(True)
         self._settings_rebuild_timer.setInterval(700)
         self._settings_rebuild_timer.timeout.connect(self.request_rebuild)
+        self._curator_timer = QTimer(self)
+        self._curator_timer.setSingleShot(True)
+        self._curator_timer.setInterval(500)
+        self._curator_timer.timeout.connect(self.refresh_curator)
 
         self._build_menu_bar()
         self._build_ui()
@@ -770,6 +870,16 @@ class MainWindow(QMainWindow):
                 font-weight: 700;
                 color: #f8fafc;
             }
+            QLabel#projectNameLabel {
+                font-size: 21px;
+                font-weight: 800;
+                color: #f8fafc;
+            }
+            QLabel#projectPathLabel {
+                color: #7dd3fc;
+                font-family: monospace;
+                font-size: 9pt;
+            }
             QLabel#subtitleLabel, QLabel#inputSummaryLabel, QLabel#hintLabel {
                 color: #94a3b8;
             }
@@ -916,6 +1026,25 @@ class MainWindow(QMainWindow):
                 background: #0ea5e9;
                 border-radius: 8px;
             }
+            QDialog#settingsDialog {
+                background: #0b1220;
+                color: #e2e8f0;
+            }
+            QDialog#settingsDialog QDialogButtonBox QPushButton {
+                min-width: 100px;
+            }
+            QTreeWidget#curatorTree::item {
+                padding: 7px;
+            }
+            QFrame#repositorySwitcher {
+                background: #020617;
+                border: 1px solid rgba(125, 211, 252, 0.55);
+                border-radius: 16px;
+            }
+            QFrame#repositorySwitcher QListWidget {
+                min-width: 430px;
+                min-height: 180px;
+            }
             """
         )
 
@@ -929,18 +1058,20 @@ class MainWindow(QMainWindow):
         header = QFrame()
         header.setObjectName("heroCard")
         header_layout = QHBoxLayout(header)
-        header_layout.setContentsMargins(20, 18, 20, 18)
+        header_layout.setContentsMargins(16, 10, 16, 10)
         header_layout.setSpacing(14)
 
         title_stack = QVBoxLayout()
-        title = QLabel("Context Builder")
-        title.setObjectName("titleLabel")
-        subtitle = QLabel("Build a lean, repo-aware context structure from files or folders.")
-        subtitle.setObjectName("subtitleLabel")
+        title_stack.setSpacing(1)
+        self.project_name_label = QLabel("No project loaded")
+        self.project_name_label.setObjectName("projectNameLabel")
+        self.project_path_label = QLabel("Drop a file or folder to detect a project root.")
+        self.project_path_label.setObjectName("projectPathLabel")
+        self.project_path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.input_summary_label = QLabel("No inputs loaded yet.")
         self.input_summary_label.setObjectName("inputSummaryLabel")
-        title_stack.addWidget(title)
-        title_stack.addWidget(subtitle)
+        title_stack.addWidget(self.project_name_label)
+        title_stack.addWidget(self.project_path_label)
         title_stack.addWidget(self.input_summary_label)
 
         self.loaded_stats_label = QLabel("No project loaded yet.")
@@ -958,27 +1089,36 @@ class MainWindow(QMainWindow):
         button_row.addWidget(self.settings_button)
         button_row.addWidget(self.reset_button)
         button_row.addWidget(self.sessions_button)
-        button_row.addStretch(1)
+        right_stack = QVBoxLayout()
+        right_stack.setSpacing(6)
+        right_stack.addWidget(self.loaded_stats_label, alignment=Qt.AlignRight)
+        right_stack.addLayout(button_row)
 
-        header_layout.addLayout(title_stack, 2)
-        header_layout.addWidget(self.loaded_stats_label, 3)
-        header_layout.addLayout(button_row, 1)
+        header_layout.addLayout(title_stack, 3)
+        header_layout.addStretch(1)
+        header_layout.addLayout(right_stack, 2)
 
-        self.settings_panel = QFrame()
-        self.settings_panel.setObjectName("card")
-        self.settings_panel.setVisible(False)
-        settings_layout = QVBoxLayout(self.settings_panel)
-        settings_layout.setContentsMargins(18, 18, 18, 18)
-        settings_layout.setSpacing(12)
+        self.settings_dialog = QDialog(self)
+        self.settings_dialog.setObjectName("settingsDialog")
+        self.settings_dialog.setWindowTitle("Context Builder Settings")
+        self.settings_dialog.setModal(False)
+        self.settings_dialog.setMinimumWidth(620)
+        settings_layout = QVBoxLayout(self.settings_dialog)
+        settings_layout.setContentsMargins(20, 20, 20, 20)
+        settings_layout.setSpacing(14)
         settings_header = QHBoxLayout()
         settings_title = QLabel("Settings")
         settings_title.setObjectName("sectionLabel")
+        settings_hint = QLabel("Changes are saved with the active context session and rebuild the workspace when needed.")
+        settings_hint.setObjectName("hintLabel")
+        settings_hint.setWordWrap(True)
         self.reset_settings_button = QPushButton("Reset Defaults")
         self.reset_settings_button.clicked.connect(self._reset_settings_defaults)
         settings_header.addWidget(settings_title)
         settings_header.addStretch(1)
         settings_header.addWidget(self.reset_settings_button)
         settings_layout.addLayout(settings_header)
+        settings_layout.addWidget(settings_hint)
 
         form = QFormLayout()
         self.project_root_edit = QLineEdit()
@@ -1005,9 +1145,11 @@ class MainWindow(QMainWindow):
         form.addRow(self.include_unchecked_folder_check)
         form.addRow(self.show_skipped_dependencies_check)
         settings_layout.addLayout(form)
+        settings_buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        settings_buttons.rejected.connect(self.settings_dialog.hide)
+        settings_layout.addWidget(settings_buttons)
 
         root_layout.addWidget(header)
-        root_layout.addWidget(self.settings_panel)
 
         splitter = QSplitter(Qt.Horizontal)
         left_container = QWidget()
@@ -1020,13 +1162,14 @@ class MainWindow(QMainWindow):
         self.tree.itemSelectionChanged.connect(self.on_tree_selection_changed)
         self.tree.itemChanged.connect(self.on_tree_item_changed)
         self.tree.setUniformRowHeights(True)
-        self.tree.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.tree.setDragEnabled(True)
         self.tree.installEventFilter(self)
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._show_tree_context_menu)
 
         flat_container = QWidget()
+        self.flat_container = flat_container
         flat_layout = QVBoxLayout(flat_container)
         flat_layout.setContentsMargins(0, 0, 0, 0)
         self.search_edit = QLineEdit()
@@ -1035,7 +1178,7 @@ class MainWindow(QMainWindow):
         self.flat_table = QTableWidget(0, 3)
         self.flat_table.setHorizontalHeaderLabels(["", "File", "Size"])
         self.flat_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.flat_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.flat_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.flat_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.flat_table.horizontalHeader().setStretchLastSection(True)
         self.flat_table.setColumnWidth(0, 42)
@@ -1049,8 +1192,47 @@ class MainWindow(QMainWindow):
         flat_layout.addWidget(self.search_edit)
         flat_layout.addWidget(self.flat_table, 1)
 
+        self.curator_container = QWidget()
+        curator_layout = QVBoxLayout(self.curator_container)
+        curator_layout.setContentsMargins(0, 0, 0, 0)
+        curator_layout.setSpacing(8)
+        self.curator_summary_label = QLabel(
+            "Enter a user prompt and analyze the workspace to rank likely context files."
+        )
+        self.curator_summary_label.setObjectName("hintLabel")
+        self.curator_summary_label.setWordWrap(True)
+        curator_buttons = QHBoxLayout()
+        self.curator_analyze_button = QPushButton("Analyze relevance")
+        self.curator_apply_selected_button = QPushButton("Apply selected")
+        self.curator_apply_button = QPushButton("Apply recommendations")
+        self.curator_apply_button.setObjectName("primaryAction")
+        curator_buttons.addWidget(self.curator_analyze_button)
+        curator_buttons.addWidget(self.curator_apply_selected_button)
+        curator_buttons.addStretch(1)
+        curator_buttons.addWidget(self.curator_apply_button)
+
+        self.curator_tree = QTreeWidget()
+        self.curator_tree.setObjectName("curatorTree")
+        self.curator_tree.setHeaderLabels(["File", "Score", "Suggested mode", "Why"])
+        self.curator_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.curator_tree.setUniformRowHeights(True)
+        self.curator_tree.header().setSectionResizeMode(0, QHeaderView.Interactive)
+        self.curator_tree.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.curator_tree.header().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.curator_tree.header().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.curator_tree.itemSelectionChanged.connect(self.on_curator_selection_changed)
+        self.curator_analyze_button.clicked.connect(self.refresh_curator)
+        self.curator_apply_selected_button.clicked.connect(
+            self.apply_selected_curator_recommendations
+        )
+        self.curator_apply_button.clicked.connect(self.apply_curator_recommendations)
+        curator_layout.addWidget(self.curator_summary_label)
+        curator_layout.addLayout(curator_buttons)
+        curator_layout.addWidget(self.curator_tree, 1)
+
         self.views.addTab(self.tree, "Tree")
         self.views.addTab(flat_container, "Flat")
+        self.views.addTab(self.curator_container, "Curator")
         left_layout.addWidget(self.views, 1)
 
         self.preview_tabs = QTabWidget()
@@ -1077,8 +1259,6 @@ class MainWindow(QMainWindow):
         task_layout = QVBoxLayout(task_card)
         task_layout.setContentsMargins(18, 18, 18, 18)
         task_layout.setSpacing(12)
-        task_heading = QLabel("LLM Task")
-        task_heading.setObjectName("sectionLabel")
         self.system_template_combo = QComboBox()
         for template_id in list(LLM_TASK_TEMPLATES.keys()) + ["custom"]:
             self.system_template_combo.addItem(template_id.replace("_", " ").title(), template_id)
@@ -1101,29 +1281,17 @@ class MainWindow(QMainWindow):
         self.system_preview = QLabel()
         self.system_preview.setWordWrap(True)
         self.system_preview.setObjectName("resolvedPrompt")
-        task_layout.addWidget(task_heading)
         task_layout.addLayout(task_selector_row)
         task_layout.addWidget(self.custom_system_prompt, 2)
         task_layout.addWidget(resolved_label)
         task_layout.addWidget(self.system_preview, 1)
         task_layout.addStretch(1)
 
-        splitter.addWidget(left_container)
-        splitter.addWidget(self.preview_tabs)
-        splitter.addWidget(task_card)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 4)
-        splitter.setStretchFactor(2, 2)
-        splitter.setSizes([420, 560, 360])
-        root_layout.addWidget(splitter, 1)
-
         prompt_card = QFrame()
         prompt_card.setObjectName("card")
         prompt_layout = QVBoxLayout(prompt_card)
         prompt_layout.setContentsMargins(18, 18, 18, 18)
         prompt_layout.setSpacing(12)
-        prompt_heading = QLabel("User Prompt")
-        prompt_heading.setObjectName("sectionLabel")
         self.user_prompt_edit = QPlainTextEdit()
         self.user_prompt_edit.setPlaceholderText("Describe the task you want the LLM to perform. This is placed at the bottom like a traditional chat prompt.")
         self.user_prompt_edit.setMinimumHeight(120)
@@ -1141,11 +1309,24 @@ class MainWindow(QMainWindow):
         copy_prompt_row.addWidget(self.copy_button)
         copy_prompt_row.addWidget(self.copy_banner, alignment=Qt.AlignLeft)
         copy_prompt_row.addStretch(1)
-        prompt_layout.addWidget(prompt_heading)
         prompt_layout.addWidget(self.user_prompt_edit)
         prompt_layout.addLayout(copy_prompt_row)
         prompt_layout.addWidget(self.disk_note)
-        root_layout.addWidget(prompt_card)
+
+        prompt_tabs = QTabWidget()
+        prompt_tabs.setObjectName("promptTabs")
+        prompt_tabs.addTab(prompt_card, "User Prompt")
+        prompt_tabs.addTab(task_card, "LLM Task")
+
+        splitter.setChildrenCollapsible(False)
+        splitter.addWidget(left_container)
+        splitter.addWidget(self.preview_tabs)
+        splitter.addWidget(prompt_tabs)
+        splitter.setStretchFactor(0, 4)
+        splitter.setStretchFactor(1, 5)
+        splitter.setStretchFactor(2, 3)
+        splitter.setSizes([520, 650, 380])
+        root_layout.addWidget(splitter, 1)
 
         footer_card = QFrame()
         footer_card.setObjectName("card")
@@ -1220,6 +1401,7 @@ class MainWindow(QMainWindow):
 
         self._apply_default_settings()
         self.setCentralWidget(central)
+        self._build_repository_switcher()
         self._build_sessions_dock()
         self._apply_styles()
         self.statusBar().setSizeGripEnabled(False)
@@ -1234,17 +1416,60 @@ class MainWindow(QMainWindow):
     def _update_input_summary(self) -> None:
         count = len(self.input_paths)
         if count == 0:
-            self.input_summary_label.setText("No inputs loaded yet.")
+            self.input_summary_label.setText("No inputs loaded.")
         elif count == 1:
-            self.input_summary_label.setText(f"1 input loaded: {self.input_paths[0]}")
+            self.input_summary_label.setText("1 input loaded")
         else:
-            self.input_summary_label.setText(f"{count} inputs loaded.")
+            self.input_summary_label.setText(f"{count} inputs loaded")
+        self._update_project_identity()
+
+    def _build_repository_switcher(self) -> None:
+        central = self.centralWidget()
+        if central is None:
+            return
+        self.repository_switcher = RepositorySwitcherPopup(central)
+        self.repository_switcher.repository_activated.connect(
+            lambda value: self._activate_repository_switch(Path(value))
+        )
+
+    def _current_repository_root(self) -> Path | None:
+        if self.workspace is not None:
+            return Path(self.workspace.project_root)
+        if not self.input_paths:
+            return None
+        candidate = Path(self.input_paths[0]).expanduser()
+        return candidate if candidate.is_dir() else candidate.parent
+
+    def _update_project_identity(self) -> None:
+        if not hasattr(self, "project_name_label"):
+            return
+        root = self._current_repository_root()
+        if root is None:
+            self.project_name_label.setText("No project loaded")
+            self.project_path_label.setText(
+                "Drop a file or folder to detect a project root."
+            )
+            self.project_path_label.setToolTip("")
+            return
+
+        try:
+            root = root.resolve()
+        except OSError:
+            pass
+        full_path = root.as_posix()
+        self.project_name_label.setText(root.name or full_path)
+        self.project_path_label.setText(full_path)
+        self.project_path_label.setToolTip(full_path)
 
     def toggle_settings_panel(self) -> None:
-        self.settings_panel.setVisible(not self.settings_panel.isVisible())
-        self.settings_button.setText("Hide Settings" if self.settings_panel.isVisible() else "Settings")
-        self.settings_action.setText("Hide Settings" if self.settings_panel.isVisible() else "Settings")
-        self._log("Settings panel %s", "opened" if self.settings_panel.isVisible() else "hidden")
+        if self.settings_dialog.isVisible():
+            self.settings_dialog.hide()
+            self._log("Settings dialog hidden")
+            return
+        self.settings_dialog.show()
+        self.settings_dialog.raise_()
+        self.settings_dialog.activateWindow()
+        self._log("Settings dialog opened")
 
     def _on_show_skipped_dependencies_changed(self) -> None:
         self._mark_session_dirty()
@@ -1342,12 +1567,151 @@ class MainWindow(QMainWindow):
     def _on_prompt_fields_changed(self) -> None:
         self._set_system_template_preview()
         self._mark_session_dirty()
+        self._curator_timer.start()
         if self.workspace is None:
             self._update_token_count()
             return
         self._sync_current_bundle()
         if self.current_result is not None:
             self._show_bundle_summary(self.current_result)
+
+    def refresh_curator(self) -> None:
+        if not hasattr(self, "curator_tree"):
+            return
+        if self.workspace is None:
+            self._curator_recommendations = []
+            self.curator_tree.clear()
+            self.curator_summary_label.setText(
+                "Add files or a repository before analyzing relevance."
+            )
+            return
+
+        explicit_ids: list[str] = []
+        if self.views.currentWidget() in (self.tree, self.flat_container):
+            explicit_ids = self._selected_file_ids()
+        self._curator_recommendations = rank_workspace_files(
+            self.workspace,
+            self.user_prompt_edit.toPlainText(),
+            explicit_file_ids=explicit_ids,
+        )
+        self._populate_curator_tree()
+
+    def _populate_curator_tree(self) -> None:
+        if self.workspace is None:
+            return
+        self.curator_tree.clear()
+        tiers = [
+            (TIER_HIGH, "Highly relevant", "✓", "#86efac"),
+            (TIER_POTENTIAL, "Potentially relevant", "?", "#fbbf24"),
+            (TIER_LOW, "Probably unnecessary", "–", "#94a3b8"),
+        ]
+        counts: dict[str, int] = {}
+        for tier, label, marker, color in tiers:
+            recommendations = [
+                item for item in self._curator_recommendations if item.tier == tier
+            ]
+            counts[tier] = len(recommendations)
+            group = QTreeWidgetItem([f"{label} ({len(recommendations)})", "", "", ""])
+            group.setFirstColumnSpanned(True)
+            group_font = group.font(0)
+            group_font.setBold(True)
+            group.setFont(0, group_font)
+            group.setForeground(0, QBrush(QColor(color)))
+            group.setFlags(group.flags() & ~Qt.ItemIsSelectable)
+            self.curator_tree.addTopLevelItem(group)
+
+            for recommendation in recommendations:
+                record = self.workspace.files.get(recommendation.file_id)
+                if record is None:
+                    continue
+                reasons = "; ".join(recommendation.reasons)
+                child = QTreeWidgetItem(
+                    [
+                        f"{marker} {record.repo_relative_path}",
+                        str(recommendation.score),
+                        recommendation.recommended_mode,
+                        reasons,
+                    ]
+                )
+                child.setData(0, Qt.UserRole, recommendation.file_id)
+                child.setData(0, Qt.UserRole + 1, recommendation.recommended_mode)
+                child.setToolTip(0, record.absolute_path)
+                child.setToolTip(3, reasons)
+                for column in range(child.columnCount()):
+                    child.setForeground(column, QBrush(QColor(color)))
+                group.addChild(child)
+            group.setExpanded(True)
+
+        self.curator_tree.resizeColumnToContents(0)
+        self.curator_summary_label.setText(
+            f"{counts.get(TIER_HIGH, 0)} highly relevant, "
+            f"{counts.get(TIER_POTENTIAL, 0)} potentially relevant, and "
+            f"{counts.get(TIER_LOW, 0)} probably unnecessary. "
+            "Recommendations are advisory until applied."
+        )
+
+    def on_curator_selection_changed(self) -> None:
+        selected_ids = self._selected_curator_file_ids()
+        if not selected_ids:
+            return
+        self.selected_file_id = selected_ids[0]
+        self.show_record(selected_ids[0])
+
+    def _selected_curator_file_ids(self) -> list[str]:
+        ids: list[str] = []
+        for item in self.curator_tree.selectedItems():
+            file_id = item.data(0, Qt.UserRole)
+            if isinstance(file_id, str):
+                ids.append(file_id)
+        return list(dict.fromkeys(ids))
+
+    def apply_selected_curator_recommendations(self) -> None:
+        self._apply_curator_recommendations(self._selected_curator_file_ids())
+
+    def apply_curator_recommendations(self) -> None:
+        if not self._curator_recommendations:
+            self.refresh_curator()
+        if not self._curator_recommendations:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Apply curator recommendations?",
+            (
+                "Apply the suggested full, hybrid, and excluded modes to all ranked files?\n\n"
+                "You can still change every file manually afterwards."
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._apply_curator_recommendations(
+            [item.file_id for item in self._curator_recommendations]
+        )
+
+    def _apply_curator_recommendations(self, file_ids: list[str]) -> None:
+        if self.workspace is None or not file_ids:
+            return
+        recommendation_by_id = {
+            item.file_id: item for item in self._curator_recommendations
+        }
+        applied = 0
+        for file_id in file_ids:
+            recommendation = recommendation_by_id.get(file_id)
+            if recommendation is None or file_id not in self.workspace.files:
+                continue
+            self._apply_file_mode_without_refresh(
+                file_id, recommendation.recommended_mode
+            )
+            applied += 1
+        if applied == 0:
+            return
+        self._refresh_all_views()
+        self._mark_session_dirty()
+        self.status_label.setText(f"Applied curator recommendations to {applied} file(s).")
+        self.statusBar().showMessage(
+            f"Applied curator recommendations to {applied} file(s)"
+        )
 
     def current_prompt_fields(self) -> PromptFields:
         template_id = str(self.system_template_combo.currentData())
@@ -1399,6 +1763,8 @@ class MainWindow(QMainWindow):
         self._apply_default_settings()
         self.tree.clear()
         self.flat_table.setRowCount(0)
+        self.curator_tree.clear()
+        self._curator_recommendations = []
         self.preview.clear()
         self.detail_label.setText("Add a file or folder to begin.")
         self.bundle_summary.clear()
@@ -1415,6 +1781,11 @@ class MainWindow(QMainWindow):
             self.current_result = None
             self.tree.clear()
             self.flat_table.setRowCount(0)
+            self.curator_tree.clear()
+            self._curator_recommendations = []
+            self.curator_summary_label.setText(
+                "Add files or a repository before analyzing relevance."
+            )
             self.preview.clear()
             self.detail_label.setText("Add a file or folder to begin.")
             self.bundle_summary.clear()
@@ -1497,6 +1868,10 @@ class MainWindow(QMainWindow):
             self.search_edit,
             self.tree,
             self.flat_table,
+            self.curator_tree,
+            self.curator_analyze_button,
+            self.curator_apply_selected_button,
+            self.curator_apply_button,
         ]:
             widget.setEnabled(enabled)
         self.refresh_button.setEnabled(True)
@@ -1519,6 +1894,12 @@ class MainWindow(QMainWindow):
         self._worker_thread = None
         self._set_controls_enabled(True)
         self.progress_bar.setVisible(False)
+        if self._pending_repository_switch is not None:
+            repository = self._pending_repository_switch
+            self._pending_repository_switch = None
+            self._pending_rebuild = False
+            self._switch_repository(repository)
+            return
         if self._pending_rebuild:
             self._pending_rebuild = False
             self.start_rebuild()
@@ -1559,9 +1940,175 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Pasted clipboard image as {target.name}")
         return True
 
+    def _cycle_repository_switcher(self, step: int) -> bool:
+        repositories = opened_repositories(existing_only=True)
+        current = self._current_repository_root()
+        if current is not None:
+            try:
+                current = current.resolve()
+            except OSError:
+                pass
+            if all(repository.resolve() != current for repository in repositories):
+                repositories.insert(0, current)
+
+        if len(repositories) < 2:
+            self.statusBar().showMessage("Open at least two repositories to use Ctrl+Tab")
+            return False
+
+        if not self.repository_switcher.isVisible():
+            self.repository_switcher.set_repositories(repositories, current)
+            self.repository_switcher.cycle(step)
+            self._position_repository_switcher()
+            self.repository_switcher.show()
+            self.repository_switcher.raise_()
+        else:
+            self.repository_switcher.cycle(step)
+        return True
+
+    def _activate_repository_switch(self, repository: Path | None = None) -> None:
+        if repository is None:
+            repository = self.repository_switcher.selected_repository()
+        self.repository_switcher.hide()
+        if repository is not None:
+            self._switch_repository(repository)
+
+    def _switch_repository(self, repository: Path) -> None:
+        repository = repository.expanduser()
+        try:
+            repository = repository.resolve()
+        except OSError:
+            pass
+        if not repository.is_dir():
+            QMessageBox.warning(
+                self,
+                "Repository unavailable",
+                f"The repository directory no longer exists:\n{repository}",
+            )
+            return
+
+        current = self._current_repository_root()
+        if current is not None:
+            try:
+                current = current.resolve()
+            except OSError:
+                pass
+            if current == repository:
+                return
+
+        if self._worker is not None:
+            self._pending_repository_switch = repository
+            self.cancel_build()
+            return
+
+        self._save_current_repository_session()
+        target_session_dir = self._session_dir_for_project_root(repository)
+        target_session = target_session_dir / "autosave.json"
+        self._set_session_dir(target_session_dir)
+        try:
+            record_opened_repository(repository)
+        except OSError as exc:
+            logger.warning("Unable to update repository history: %s", exc)
+
+        if target_session.exists():
+            if self._load_session_from_path(target_session, announce=False):
+                self.status_label.setText(f"Switched to {repository.name}.")
+                self.statusBar().showMessage(f"Switched repository to {repository}")
+            return
+
+        self._start_repository_session(repository, target_session)
+
+    def _save_current_repository_session(self) -> None:
+        if not self.input_paths or self._loading_session:
+            return
+        path = self._current_session_path or (self._session_dir / "autosave.json")
+        if not self._write_session_file(path, status_message="Saved before repository switch"):
+            return
+
+        autosave_path = self._session_dir / "autosave.json"
+        if self._same_session_path(path, self._resolve_session_path(autosave_path)):
+            return
+        try:
+            autosave_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = autosave_path.with_suffix(".json.tmp")
+            temporary.write_text(self._session_payload_text(), encoding="utf-8")
+            temporary.replace(autosave_path)
+        except OSError as exc:
+            logger.warning("Unable to write repository autosave %s: %s", autosave_path, exc)
+
+    def _start_repository_session(self, repository: Path, session_path: Path) -> None:
+        self._loading_session = True
+        try:
+            self.input_paths = [repository.as_posix()]
+            self.file_overrides.clear()
+            self.workspace = None
+            self.current_result = None
+            self.selected_file_id = None
+            self.user_prompt_edit.clear()
+            self.custom_system_prompt.clear()
+            default_index = self.system_template_combo.findData("code_editing")
+            if default_index >= 0:
+                self.system_template_combo.setCurrentIndex(default_index)
+            self._apply_default_settings()
+            self.tree.clear()
+            self.flat_table.setRowCount(0)
+            self.preview.clear()
+            self.detail_label.setText("Select a file to inspect it here.")
+            self.bundle_summary.clear()
+            self._current_session_path = session_path
+            self._last_saved_session_payload = ""
+        finally:
+            self._loading_session = False
+
+        self._update_input_summary()
+        self._update_loaded_stats()
+        self._update_token_count(0, 0)
+        self._write_session_file(session_path, status_message="Created repository session")
+        self.status_label.setText(f"Opening {repository.name}...")
+        self.statusBar().showMessage(f"Opening repository {repository}")
+        self.request_rebuild()
+
+    def _position_repository_switcher(self) -> None:
+        if not hasattr(self, "repository_switcher"):
+            return
+        central = self.centralWidget()
+        if central is None:
+            return
+        size = self.repository_switcher.sizeHint()
+        width = max(470, size.width())
+        height = max(240, size.height())
+        x = max(10, (central.width() - width) // 2)
+        y = max(10, (central.height() - height) // 3)
+        self.repository_switcher.setGeometry(x, y, width, height)
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        if hasattr(self, "repository_switcher") and self.repository_switcher.isVisible():
+            self._position_repository_switcher()
+
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # type: ignore[override]
         if event.type() == QEvent.Type.KeyPress:
             key_event = event if isinstance(event, QKeyEvent) else None
+            if key_event is not None:
+                modifiers = key_event.modifiers()
+                if (
+                    key_event.key() in {Qt.Key_Tab, Qt.Key_Backtab}
+                    and modifiers & Qt.ControlModifier
+                ):
+                    backwards = (
+                        key_event.key() == Qt.Key_Backtab
+                        or bool(modifiers & Qt.ShiftModifier)
+                    )
+                    if self._cycle_repository_switcher(-1 if backwards else 1):
+                        event.accept()
+                        return True
+                if (
+                    key_event.key() == Qt.Key_Escape
+                    and hasattr(self, "repository_switcher")
+                    and self.repository_switcher.isVisible()
+                ):
+                    self.repository_switcher.hide()
+                    event.accept()
+                    return True
             if (
                 key_event is not None
                 and key_event.matches(QKeySequence.StandardKey.Paste)
@@ -1583,6 +2130,17 @@ class MainWindow(QMainWindow):
                     self._delete_selected_session()
                     event.accept()
                     return True
+        elif event.type() == QEvent.Type.KeyRelease:
+            key_event = event if isinstance(event, QKeyEvent) else None
+            if (
+                key_event is not None
+                and key_event.key() == Qt.Key_Control
+                and hasattr(self, "repository_switcher")
+                and self.repository_switcher.isVisible()
+            ):
+                self._activate_repository_switch()
+                event.accept()
+                return True
         return super().eventFilter(watched, event)
 
     def on_build_progress(self, message: str, current: int, total: int) -> None:
@@ -1598,6 +2156,10 @@ class MainWindow(QMainWindow):
     def on_build_finished(self, result: BuildResult) -> None:
         self._log("Scan complete: %d tracked file(s), %d dependency edge(s)", len(result.bundle["files"]), len(result.bundle["dependency_graph"]))
         self.workspace = result.workspace
+        try:
+            record_opened_repository(result.workspace.project_root)
+        except OSError as exc:
+            logger.warning("Unable to update repository history: %s", exc)
         for record in self.workspace.files.values():
             decision = self._pending_image_inclusion.pop(record.absolute_path, None)
             if decision is not None and record.is_image:
@@ -1697,19 +2259,16 @@ class MainWindow(QMainWindow):
         return " &nbsp; ".join(detail_parts)
 
     def _update_loaded_stats(self) -> None:
+        self._update_project_identity()
         if self.workspace is None or self.current_result is None:
-            self.loaded_stats_label.setText("No project loaded yet.")
+            self.loaded_stats_label.setText("No bundle yet")
             return
 
         bundle = self.current_result.bundle
         file_count = len(bundle["files"])
-        graph_groups = len(bundle["dependency_graph"])
         linked_files = sum(len(item["includes"]) for item in bundle["dependency_graph"])
         self.loaded_stats_label.setText(
-            f"<b>Files:</b> {file_count:,} &nbsp; "
-            f"<b>Dependency groups:</b> {graph_groups:,} &nbsp; "
-            f"<b>Linked dependencies:</b> {linked_files:,}<br>"
-            f"<b>Project root:</b> {self.workspace.project_root.as_posix()}"
+            f"<b>{file_count:,}</b> files &nbsp; <b>{linked_files:,}</b> links"
         )
 
     def _update_token_count(self, estimated_tokens: int | None = None, json_bytes: int | None = None) -> None:
@@ -1742,6 +2301,7 @@ class MainWindow(QMainWindow):
         self._sync_current_bundle()
         self.refresh_tree()
         self.refresh_flat_table()
+        self._curator_timer.start()
         if self.current_result is not None:
             self._show_bundle_summary(self.current_result)
         if self.selected_file_id and self.workspace and self.selected_file_id in self.workspace.files:
@@ -2062,6 +2622,7 @@ class MainWindow(QMainWindow):
         if isinstance(file_id, str):
             self.selected_file_id = file_id
             self.show_record(file_id)
+            self._curator_timer.start()
 
 
     def on_tree_item_changed(self, item: QTreeWidgetItem, column: int) -> None:
@@ -2076,13 +2637,14 @@ class MainWindow(QMainWindow):
     def on_table_selection_changed(self) -> None:
         if self._refreshing_table:
             return
-        items = self.flat_table.selectedItems()
-        if not items:
+        item = self.flat_table.currentItem()
+        if item is None:
             return
-        file_id = items[0].data(Qt.UserRole)
+        file_id = item.data(Qt.UserRole)
         if isinstance(file_id, str):
             self.selected_file_id = file_id
             self.show_record(file_id)
+            self._curator_timer.start()
 
 
     def on_table_item_changed(self, item: QTableWidgetItem) -> None:
@@ -2102,7 +2664,10 @@ class MainWindow(QMainWindow):
         item = self.tree.itemAt(position)
         if item is None:
             return
-        self.tree.setCurrentItem(item)
+        if not item.isSelected():
+            self.tree.clearSelection()
+            item.setSelected(True)
+        self.tree.setCurrentItem(item, 0, QItemSelectionModel.NoUpdate)
         file_id = item.data(0, Qt.UserRole)
         if not isinstance(file_id, str):
             return
@@ -2112,11 +2677,15 @@ class MainWindow(QMainWindow):
         row = self.flat_table.rowAt(position.y())
         if row < 0:
             return
-        self.flat_table.selectRow(row)
+        if not self.flat_table.selectionModel().isRowSelected(row, self.flat_table.rootIndex()):
+            self.flat_table.clearSelection()
+            self.flat_table.selectRow(row)
         item = self.flat_table.item(row, 1) or self.flat_table.item(row, 0)
         file_id = item.data(Qt.UserRole) if item is not None else None
         if not isinstance(file_id, str):
             return
+        if item is not None:
+            self.flat_table.setCurrentItem(item, QItemSelectionModel.NoUpdate)
         self._show_file_context_menu(file_id, self.flat_table.viewport().mapToGlobal(position))
 
     def _show_file_context_menu(self, file_id: str, global_position) -> None:
@@ -2171,19 +2740,21 @@ class MainWindow(QMainWindow):
 
     def _selected_file_ids(self) -> list[str]:
         ids: list[str] = []
-        if self.views.currentWidget() == self.tree:
-            item = self.tree.currentItem()
-            if item is not None:
+        current_view = self.views.currentWidget()
+        if current_view == self.tree:
+            for item in self.tree.selectedItems():
                 file_id = item.data(0, Qt.UserRole)
                 if isinstance(file_id, str):
                     ids.append(file_id)
+        elif current_view == self.curator_container:
+            ids.extend(self._selected_curator_file_ids())
         else:
-            items = self.flat_table.selectedItems()
-            if items:
-                file_id = items[0].data(Qt.UserRole)
+            for index in self.flat_table.selectionModel().selectedRows():
+                item = self.flat_table.item(index.row(), 1) or self.flat_table.item(index.row(), 0)
+                file_id = item.data(Qt.UserRole) if item is not None else None
                 if isinstance(file_id, str):
                     ids.append(file_id)
-        return ids
+        return list(dict.fromkeys(ids))
 
 
     def _dependency_child_map(self) -> dict[str, set[str]]:
@@ -2254,6 +2825,21 @@ class MainWindow(QMainWindow):
         self._apply_file_mode_without_refresh(file_id, mode)
         if mode == "excluded":
             self._cascade_excluded_dependencies(file_id)
+        self._refresh_all_views()
+        self._mark_session_dirty()
+
+    def _set_selected_file_mode(self, mode: str) -> None:
+        if self.workspace is None:
+            return
+        file_ids = self._selected_file_ids()
+        if not file_ids:
+            return
+        for file_id in file_ids:
+            if file_id not in self.workspace.files:
+                continue
+            self._apply_file_mode_without_refresh(file_id, mode)
+            if mode == "excluded":
+                self._cascade_excluded_dependencies(file_id)
         self._refresh_all_views()
         self._mark_session_dirty()
 
@@ -2367,23 +2953,19 @@ class MainWindow(QMainWindow):
             self._refresh_all_views()
 
     def include_full_selected(self) -> None:
-        for file_id in self._selected_file_ids():
-            self._set_file_mode(file_id, "full")
+        self._set_selected_file_mode("full")
 
     def include_hybrid_selected(self) -> None:
-        for file_id in self._selected_file_ids():
-            self._set_file_mode(file_id, "hybrid")
+        self._set_selected_file_mode("hybrid")
 
     def include_outline_selected(self) -> None:
-        for file_id in self._selected_file_ids():
-            self._set_file_mode(file_id, "outline")
+        self._set_selected_file_mode("outline")
 
     def include_truncated_selected(self) -> None:
         self.include_hybrid_selected()
 
     def exclude_selected(self) -> None:
-        for file_id in self._selected_file_ids():
-            self._set_file_mode(file_id, "excluded")
+        self._set_selected_file_mode("excluded")
 
 
     def copy_json(self) -> None:
